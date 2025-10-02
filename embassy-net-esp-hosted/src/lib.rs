@@ -97,7 +97,7 @@ enum InterfaceType {
 }
 
 const MAX_SPI_BUFFER_SIZE: usize = 1600;
-const HEARTBEAT_MAX_GAP: Duration = Duration::from_secs(20);
+const HEARTBEAT_MAX_GAP: Duration = Duration::from_secs(30);
 
 /// State for the esp-hosted driver.
 pub struct State {
