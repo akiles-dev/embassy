@@ -341,9 +341,13 @@ where
         match payload {
             CtrlMsgPayload::EventEspInit(_) => {
                 self.shared.init_done();
+                info!("esp init");
                 self.heartbeat_deadline = Instant::now() + HEARTBEAT_MAX_GAP
             }
-            CtrlMsgPayload::EventHeartbeat(_) => self.heartbeat_deadline = Instant::now() + HEARTBEAT_MAX_GAP,
+            CtrlMsgPayload::EventHeartbeat(_) => {
+                info!("heartbeat!");
+                self.heartbeat_deadline = Instant::now() + HEARTBEAT_MAX_GAP
+            }
             CtrlMsgPayload::EventStationDisconnectFromAp(e) => {
                 info!("disconnected, code {}", e.resp);
                 self.state_ch.set_link_state(LinkState::Down);
