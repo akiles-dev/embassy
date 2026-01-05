@@ -1,4 +1,5 @@
 use core::fmt;
+
 use core::ops::{Add, AddAssign, Sub, SubAssign};
 
 use super::{Duration, GCD_1G, GCD_1K, GCD_1M, TICK_HZ};
