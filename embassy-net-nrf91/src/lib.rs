@@ -538,7 +538,6 @@ impl StateInner {
     }
 
     fn send_message(&mut self, msg: &mut Message, data: &[u8]) -> Result<(), NoFreeBufs> {
-        info!("send message");
         if data.is_empty() {
             msg.data = ptr::null_mut();
             msg.data_len = 0;
