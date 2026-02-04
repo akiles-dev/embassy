@@ -116,6 +116,13 @@ async fn new_internal<'a>(
     shmem: &'a mut [MaybeUninit<u8>],
     trace_buffer: Option<&'a mut TraceBuffer>,
 ) -> (NetDriver<'a>, Control<'a>, Runner<'a>, Option<TraceReader<'a>>) {
+    // Ensure modem is off before we configure memory
+    let power = pac::POWER_S;
+    power
+        .ltemodem()
+        .startn()
+        .write(|w| w.set_startn(pac::power::vals::Startn::HOLD));
+
     let shmem_len = shmem.len();
     let shmem_ptr = shmem.as_mut_ptr() as *mut u8;
 
@@ -199,11 +206,10 @@ async fn new_internal<'a>(
 
     compiler_fence(Ordering::SeqCst);
 
-    let power = pac::POWER_S;
-    // POWER.LTEMODEM.STARTN = 0
-    // TODO: The reg is missing in the PAC??
-    let startn = unsafe { (power.as_ptr() as *mut u32).add(0x610 / 4) };
-    unsafe { startn.write_volatile(0) }
+    power
+        .ltemodem()
+        .startn()
+        .write(|w| w.set_startn(pac::power::vals::Startn::START));
 
     unsafe { NVIC::unmask(pac::Interrupt::IPC) };
 
