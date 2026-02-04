@@ -538,6 +538,7 @@ impl StateInner {
     }
 
     fn send_message(&mut self, msg: &mut Message, data: &[u8]) -> Result<(), NoFreeBufs> {
+        info!("send message");
         if data.is_empty() {
             msg.data = ptr::null_mut();
             msg.data_len = 0;
@@ -557,8 +558,10 @@ impl StateInner {
                 msg.data_len = 0;
                 self.tx_buf_used[buf_idx] = false;
                 self.tx_waker.wake();
+                info!("cleanup failure");
                 Err(e)
             } else {
+                info!("send OK");
                 Ok(())
             }
         }
@@ -965,6 +968,8 @@ impl<'a> Runner<'a> {
                     msg.param[4..8].copy_from_slice(&fd.to_le_bytes());
                     if let Err(e) = state.send_message(&mut msg, buf) {
                         warn!("tx failed: {:?}", e);
+                    } else {
+                        info!("tx succeeded");
                     }
                     self.ch.tx_done();
                 }
