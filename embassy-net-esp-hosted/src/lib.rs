@@ -239,7 +239,12 @@ where
                         self.heartbeat_deadline = Instant::now() + HEARTBEAT_MAX_GAP;
                         continue;
                     }
-                    panic!("heartbeat from esp32 stopped")
+                    let ioctl_state = match self.shared.ioctl_state() {
+                        ioctl::IoctlStateKind::Pending => "pending",
+                        ioctl::IoctlStateKind::Sent => "sent",
+                        ioctl::IoctlStateKind::Done => "done",
+                    };
+                    panic!("heartbeat from esp32 stopped (ioctl={})", ioctl_state)
                 }
             }
 
@@ -339,8 +344,14 @@ where
         };
 
         match payload {
-            CtrlMsg_::Payload::EventEspInit(_) => self.shared.init_done(),
-            CtrlMsg_::Payload::EventHeartbeat(_) => self.heartbeat_deadline = Instant::now() + HEARTBEAT_MAX_GAP,
+            CtrlMsg_::Payload::EventEspInit(_) => {
+                warn!("esp32 init event received (unexpected during normal operation)");
+                self.shared.init_done();
+            }
+            CtrlMsg_::Payload::EventHeartbeat(e) => {
+                debug!("heartbeat hb_num={}", e.hb_num);
+                self.heartbeat_deadline = Instant::now() + HEARTBEAT_MAX_GAP;
+            }
             CtrlMsg_::Payload::EventStationConnectedToAp(e) => {
                 info!("connected, code {}", e.resp);
                 self.state_ch.set_link_state(LinkState::Up);

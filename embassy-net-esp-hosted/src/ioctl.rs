@@ -19,6 +19,13 @@ enum IoctlState {
     Done { resp_len: usize },
 }
 
+/// Simplified ioctl state for diagnostic purposes.
+pub(crate) enum IoctlStateKind {
+    Pending,
+    Sent,
+    Done,
+}
+
 pub struct Shared(RefCell<SharedInner>);
 
 struct SharedInner {
@@ -118,6 +125,15 @@ impl Shared {
     pub(crate) fn state(&self) -> ControlState {
         let this = self.0.borrow();
         this.state
+    }
+
+    pub(crate) fn ioctl_state(&self) -> IoctlStateKind {
+        let this = self.0.borrow();
+        match this.ioctl {
+            IoctlState::Pending(_) => IoctlStateKind::Pending,
+            IoctlState::Sent { .. } => IoctlStateKind::Sent,
+            IoctlState::Done { .. } => IoctlStateKind::Done,
+        }
     }
 
     pub fn init_done(&self) {
