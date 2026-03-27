@@ -16,7 +16,10 @@ bind_interrupts!(struct Irqs {
 
 // RAM buffer for firmware + execution RAM + virtual register interface.
 // Total size 0x3D40 per the nRF54L15 porting guide.
-static SQSPI_RAM: StaticCell<[u8; 0x3D40]> = StaticCell::new();
+// Must be 128-byte aligned (VPR INITPC requirement).
+#[repr(C, align(128))]
+struct AlignedSqspiRam([u8; 0x3D40]);
+static SQSPI_RAM: StaticCell<AlignedSqspiRam> = StaticCell::new();
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -28,12 +31,12 @@ async fn main(_spawner: Spawner) {
     info!("firmware size: {} bytes", SQSPI_FW.len());
 
     let mut config = sqspi::Config::default();
-    config.sck_freq_khz = 8000;
+    config.frequency = sqspi::Frequency::M8;
     config.spi_mode = sqspi::MODE_0;
     config.lines = sqspi::SpiLines::Quad1_1_4;
     info!(
-        "config: sck_freq_khz={}, lines=Quad1_1_4, addr=24bit, read_opcode=0x{:02x}, write_opcode=0x{:02x}",
-        config.sck_freq_khz, config.read_opcode, config.write_opcode
+        "config: frequency=M8, lines=Quad1_1_4, addr=24bit, read_opcode=0x{:02x}, write_opcode=0x{:02x}",
+        config.read_opcode, config.write_opcode
     );
 
     info!("initializing sQSPI driver...");
@@ -41,13 +44,13 @@ async fn main(_spawner: Spawner) {
         p.SQSPI,
         Irqs,
         SQSPI_FW,
-        SQSPI_RAM.init([0; 0x3D40]),
-        p.P1_01, // sck
-        p.P1_02, // csn
-        p.P1_03, // io0
-        p.P1_04, // io1
-        p.P1_05, // io2
-        p.P1_06, // io3
+        &mut SQSPI_RAM.init(AlignedSqspiRam([0; 0x3D40])).0,
+        p.P2_06, // sck
+        p.P2_05, // csn
+        p.P2_07, // io0
+        p.P2_04, // io1
+        p.P2_01, // io2
+        p.P2_00, // io3
         config,
     ));
 

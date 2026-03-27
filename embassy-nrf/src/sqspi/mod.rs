@@ -25,6 +25,7 @@ use crate::interrupt;
 use crate::interrupt::typelevel::Interrupt;
 use crate::pac;
 use crate::pac::gpio::vals as gpiovals;
+pub use crate::qspi_common::*;
 
 // ============================================================================
 // Firmware metadata
@@ -151,75 +152,12 @@ pub enum SpiLines {
     Quad1_4_4,
 }
 
-/// Address mode (24-bit or 32-bit).
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum AddressMode {
-    /// 24-bit addressing (3 bytes).
-    _24Bit,
-    /// 32-bit addressing (4 bytes).
-    _32Bit,
-}
-
-/// SPI clock polarity.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum Polarity {
-    /// Clock idle low.
-    IdleLow,
-    /// Clock idle high.
-    IdleHigh,
-}
-
-/// SPI clock phase.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum Phase {
-    /// Data captured on first clock edge.
-    CaptureOnFirstTransition,
-    /// Data captured on second clock edge.
-    CaptureOnSecondTransition,
-}
-
-/// SPI mode (polarity + phase).
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct Mode {
-    /// Clock polarity.
-    pub polarity: Polarity,
-    /// Clock phase.
-    pub phase: Phase,
-}
-
-/// SPI Mode 0: CPOL=0, CPHA=0.
-pub const MODE_0: Mode = Mode {
-    polarity: Polarity::IdleLow,
-    phase: Phase::CaptureOnFirstTransition,
-};
-
-/// SPI Mode 1: CPOL=0, CPHA=1.
-pub const MODE_1: Mode = Mode {
-    polarity: Polarity::IdleLow,
-    phase: Phase::CaptureOnSecondTransition,
-};
-
-/// SPI Mode 2: CPOL=1, CPHA=0.
-pub const MODE_2: Mode = Mode {
-    polarity: Polarity::IdleHigh,
-    phase: Phase::CaptureOnFirstTransition,
-};
-
-/// SPI Mode 3: CPOL=1, CPHA=1.
-pub const MODE_3: Mode = Mode {
-    polarity: Polarity::IdleHigh,
-    phase: Phase::CaptureOnSecondTransition,
-};
 
 /// sQSPI driver configuration.
 #[non_exhaustive]
 pub struct Config {
-    /// SCK clock frequency in kHz. The actual divider is `128 MHz / (sck_freq_khz * 1000)`.
-    pub sck_freq_khz: u32,
+    /// QSPI bus frequency.
+    pub frequency: Frequency,
     /// SPI clock polarity and phase.
     pub spi_mode: Mode,
     /// Multi-line mode configuration.
@@ -239,7 +177,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            sck_freq_khz: 8000,
+            frequency: Frequency::M8,
             spi_mode: MODE_0,
             lines: SpiLines::Quad1_1_4,
             address_mode: AddressMode::_24Bit,
@@ -318,7 +256,8 @@ impl<'d> Sqspi<'d> {
     /// - `_irq`: Interrupt binding for VPR00.
     /// - `firmware`: The sQSPI firmware binary (starts with `softperipheral_metadata_t`).
     /// - `ram`: A static mutable RAM buffer for the firmware + register interface.
-    ///   Must be at least `fw_ram_total_size` bytes (typically 0x3D40 for nRF54L15).
+    ///   Must be at least `fw_ram_total_size + 127` bytes (typically 0x3D40 + 127
+    ///   for nRF54L15) to allow for 128-byte alignment of the VPR init PC.
     /// - `sck`, `csn`, `io0`..`io3`: GPIO pins.
     /// - `config`: Driver configuration.
     pub fn new<T: Instance>(
@@ -338,24 +277,30 @@ impl<'d> Sqspi<'d> {
         let vpr = T::vpr_regs();
         let state = T::state();
 
+        // The VPR INITPC register requires 128-byte alignment (lower 7 bits
+        // are ignored by hardware). Align the usable RAM start upward.
+        let raw_base = ram.as_mut_ptr() as usize;
+        let aligned_base = (raw_base + 127) & !127;
+        let alignment_pad = aligned_base - raw_base;
+        let usable_len = ram.len() - alignment_pad;
+
         // Validate RAM buffer is large enough.
         let shared_ram_offset = meta.fw_shared_ram_addr_offset as usize;
         let code_size = meta.code_size_bytes();
         let needed = shared_ram_offset + regs::Regs::SIZE + code_size;
         info!(
-            "fw metadata: self_boot={}, code_size={}, shared_ram_offset={}, needed={}, ram_len={}",
-            meta.self_boot, code_size, shared_ram_offset, needed, ram.len()
+            "fw metadata: self_boot={}, code_size={}, shared_ram_offset={}, needed={}, ram_len={} (usable={}, align_pad={})",
+            meta.self_boot, code_size, shared_ram_offset, needed, ram.len(), usable_len, alignment_pad
         );
-        if ram.len() < needed {
+        if usable_len < needed {
             return Err(Error::BufferTooSmall);
         }
 
         // Compute register base address.
-        // Layout: [firmware code | execution RAM | register interface]
-        // reg_base = ram_base + shared_ram_offset + code_size
-        // But per the C driver: vpr_init_pc = p_reg - fw_shared_ram_addr_offset - (fw_code_size << 4)
-        // So: p_reg = ram_base + code_size + fw_shared_ram_addr_offset
-        let ram_base = ram.as_mut_ptr() as usize;
+        // Layout: [alignment pad | firmware code | execution RAM | register interface]
+        // reg_base = aligned_base + code_size + shared_ram_offset
+        // The VPR init PC = aligned_base (128-byte aligned).
+        let ram_base = aligned_base;
         let reg_base = ram_base + code_size + shared_ram_offset;
         let reg_ptr = reg_base as *mut ();
         let sp_regs = unsafe { regs::Regs::from_ptr(reg_ptr) };
@@ -397,6 +342,11 @@ impl<'d> Sqspi<'d> {
                 copy_len, firmware.len(), vpr_init_pc, code_size
             );
             unsafe {
+                // Zero the entire code region first. The firmware binary may be
+                // smaller than fw_code_size (the remaining bytes are .bss and must
+                // be zero). The C driver copies the full fw_code_size from a
+                // pre-padded binary; we zero-fill then overlay the actual code.
+                ptr::write_bytes(vpr_init_pc as *mut u8, 0, code_size);
                 ptr::copy_nonoverlapping(firmware.as_ptr(), vpr_init_pc as *mut u8, copy_len);
             }
         }
@@ -438,14 +388,11 @@ impl<'d> Sqspi<'d> {
         // ---- Phase 2: Configure device (nrf_sqspi_dev_cfg) ----
 
         // Configure baud rate.
-        // See `nrf_sqspi.c` line 349: clkdiv = SP_VPR_BASE_FREQ_HZ / (sck_freq_khz * 1000)
-        let clkdiv = if config.sck_freq_khz > 0 {
-            regs::SP_VPR_BASE_FREQ_HZ / (config.sck_freq_khz * 1000)
-        } else {
-            0
-        };
+        // The QSPI Frequency enum value maps to 32 MHz / (val + 1).
+        // With a 128 MHz base clock, divider = 128 MHz / freq = 4 * (val + 1).
+        let clkdiv = 4 * (config.frequency as u32 + 1);
         sp_regs.core().baudr().write_value(clkdiv);
-        info!("configured: clkdiv={}, sck_freq_khz={}", clkdiv, config.sck_freq_khz);
+        info!("configured: clkdiv={}, frequency={}", clkdiv, config.frequency as u8);
 
         // Configure RX sample delay if requested.
         // See `nrf_sqspi.c` line 404.
@@ -453,12 +400,43 @@ impl<'d> Sqspi<'d> {
             sp_regs.core().rxsampledelay().write_value(delay as u32);
         }
 
+        // Verify register writes by reading back key values.
+        info!(
+            "readback: enable={}, baudr={}, dfs={}, bpp={}, bitorder={}, dr22={}, intenset=0x{:08x}",
+            sp_regs.enable().read(),
+            sp_regs.core().baudr().read(),
+            sp_regs.format().dfs().read(),
+            sp_regs.format().bpp().read(),
+            sp_regs.format().bitorder().read(),
+            sp_regs.core().dr(22).read(),
+            sp_regs.intenset().read(),
+        );
+
+        // Dump SPSYNC state before activation.
+        info!(
+            "spsync before activate: aux[0]={}, aux[1]={}, aux[2]={}, aux[3]={}",
+            sp_regs.spsync().aux(0).read(),
+            sp_regs.spsync().aux(1).read(),
+            sp_regs.spsync().aux(2).read(),
+            sp_regs.spsync().aux(3).read(),
+        );
+
+        // Dump first 16 words of the register region for layout verification.
+        for i in 0..16 {
+            let addr = reg_base + i * 4;
+            let val = unsafe { (addr as *const u32).read_volatile() };
+            trace!("reg[0x{:03x}] @ 0x{:08x} = 0x{:08x}", i * 4, addr, val);
+        }
+
         // ---- Phase 3: Activate (nrf_sqspi_activate) ----
 
         // Enable the sQSPI and issue ASB.
         // See `nrf_sqspi.c` lines 507-515 (nrf_sqspi_activate).
         sp_regs.enable().write_value(1);
-        info!("activating (ENABLE=1, issuing ASB)");
+        info!(
+            "activating (ENABLE=1, issuing ASB), enable readback={}",
+            sp_regs.enable().read()
+        );
 
         let mut driver = Self {
             regs: sp_regs,

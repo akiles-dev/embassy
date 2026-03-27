@@ -16,9 +16,9 @@ use crate::gpio::{self, Pin as GpioPin};
 use crate::interrupt::typelevel::Interrupt;
 use crate::pac::gpio::vals as gpiovals;
 use crate::pac::qspi::vals;
-pub use crate::pac::qspi::vals::{
-    Addrmode as AddressMode, Ppsize as WritePageSize, Readoc as ReadOpcode, Spimode as SpiMode, Writeoc as WriteOpcode,
-};
+use crate::pac::qspi::vals::{Addrmode, Spimode};
+pub use crate::pac::qspi::vals::{Ppsize as WritePageSize, Readoc as ReadOpcode, Writeoc as WriteOpcode};
+pub use crate::qspi_common::*;
 use crate::{interrupt, pac};
 
 /// Deep power-down config.
@@ -27,42 +27,6 @@ pub struct DeepPowerDownConfig {
     pub enter_time: u16,
     /// Time required for exiting DPM, in units of 16us
     pub exit_time: u16,
-}
-
-/// QSPI bus frequency.
-pub enum Frequency {
-    /// 32 Mhz
-    M32 = 0,
-    /// 16 Mhz
-    M16 = 1,
-    /// 10.7 Mhz
-    M10_7 = 2,
-    /// 8 Mhz
-    M8 = 3,
-    /// 6.4 Mhz
-    M6_4 = 4,
-    /// 5.3 Mhz
-    M5_3 = 5,
-    /// 4.6 Mhz
-    M4_6 = 6,
-    /// 4 Mhz
-    M4 = 7,
-    /// 3.6 Mhz
-    M3_6 = 8,
-    /// 3.2 Mhz
-    M3_2 = 9,
-    /// 2.9 Mhz
-    M2_9 = 10,
-    /// 2.7 Mhz
-    M2_7 = 11,
-    /// 2.5 Mhz
-    M2_5 = 12,
-    /// 2.3 Mhz
-    M2_3 = 13,
-    /// 2.1 Mhz
-    M2_1 = 14,
-    /// 2 Mhz
-    M2 = 15,
 }
 
 /// QSPI config.
@@ -85,7 +49,7 @@ pub struct Config {
     /// Value is specified in number of 64 MHz periods (15.625 ns), valid values between 0 and 7 (inclusive)
     pub rx_delay: u8,
     /// Whether data is captured on the clock rising edge and data is output on a falling edge (MODE0) or vice-versa (MODE3)
-    pub spi_mode: SpiMode,
+    pub spi_mode: Mode,
     /// Addressing mode (24-bit or 32-bit)
     pub address_mode: AddressMode,
     /// Flash memory capacity in bytes. This is the value reported by the `embedded-storage` traits.
@@ -182,7 +146,10 @@ impl<'d> Qspi<'d> {
         config_pin!(io3);
 
         r.ifconfig0().write(|w| {
-            w.set_addrmode(config.address_mode);
+            w.set_addrmode(match config.address_mode {
+                AddressMode::_24Bit => Addrmode::_24BIT,
+                AddressMode::_32Bit => Addrmode::_32BIT,
+            });
             w.set_dpmenable(config.deep_power_down.is_some());
             w.set_ppsize(config.write_page_size);
             w.set_readoc(config.read_opcode);
@@ -199,7 +166,10 @@ impl<'d> Qspi<'d> {
         r.ifconfig1().write(|w| {
             w.set_sckdelay(config.sck_delay);
             w.set_dpmen(false);
-            w.set_spimode(config.spi_mode);
+            w.set_spimode(match (config.spi_mode.polarity, config.spi_mode.phase) {
+                (Polarity::IdleHigh, Phase::CaptureOnSecondTransition) => Spimode::MODE3,
+                _ => Spimode::MODE0,
+            });
             w.set_sckfreq(config.frequency as u8);
         });
 

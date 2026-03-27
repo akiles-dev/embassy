@@ -148,6 +148,8 @@ pub mod pwm;
 #[cfg(not(feature = "_nrf54l"))] // TODO
 #[cfg(not(any(feature = "_nrf51", feature = "_nrf91", feature = "_nrf5340-net")))]
 pub mod qdec;
+#[cfg(any(feature = "nrf52840", feature = "_nrf5340-app", feature = "_nrf54l"))]
+pub mod qspi_common;
 #[cfg(not(feature = "_nrf54l"))] // TODO
 #[cfg(any(feature = "nrf52840", feature = "_nrf5340-app"))]
 pub mod qspi;
