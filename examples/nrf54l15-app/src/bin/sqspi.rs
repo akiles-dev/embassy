@@ -1,10 +1,11 @@
 #![no_std]
 #![no_main]
 
+use core::mem::MaybeUninit;
+use core::slice;
 use defmt::{info, unwrap, warn};
 use embassy_executor::Spawner;
-use embassy_nrf::{bind_interrupts, peripherals, sqspi};
-use static_cell::StaticCell;
+use embassy_nrf::{bind_interrupts, pac, peripherals, sqspi};
 use {defmt_rtt as _, panic_probe as _};
 
 // The firmware binary for the FLPR core (compiled RISC-V code).
@@ -14,18 +15,17 @@ bind_interrupts!(struct Irqs {
     VPR00 => sqspi::InterruptHandler<peripherals::SQSPI>;
 });
 
-// RAM buffer for firmware + execution RAM + virtual register interface.
-// Total size 0x3D40 per the nRF54L15 porting guide.
-// Must be 128-byte aligned (VPR INITPC requirement).
-#[repr(C, align(128))]
-struct AlignedSqspiRam([u8; 0x3D40]);
-static SQSPI_RAM: StaticCell<AlignedSqspiRam> = StaticCell::new();
+unsafe extern "C" {
+    static __start_sqspi: u8;
+    static __end_sqspi: u8;
+}
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let mut nrf_config = embassy_nrf::config::Config::default();
     nrf_config.clock_speed = embassy_nrf::config::ClockSpeed::CK128;
     let p = embassy_nrf::init(nrf_config);
+    embassy_time::Timer::after_secs(2).await;
 
     info!("sQSPI example starting");
     info!("firmware size: {} bytes", SQSPI_FW.len());
@@ -39,23 +39,28 @@ async fn main(_spawner: Spawner) {
         config.read_opcode, config.write_opcode
     );
 
+    let sqspi_mem = unsafe {
+        let sqspi_start = &__start_sqspi as *const u8 as *mut MaybeUninit<u8>;
+        let sqspi_end = &__end_sqspi as *const u8 as *mut MaybeUninit<u8>;
+        let sqspi_len = sqspi_end.offset_from(sqspi_start) as usize;
+        slice::from_raw_parts_mut(sqspi_start, sqspi_len)
+    };
+
     info!("initializing sQSPI driver...");
     let mut sqspi = unwrap!(sqspi::Sqspi::new(
-        p.SQSPI,
-        Irqs,
-        SQSPI_FW,
-        &mut SQSPI_RAM.init(AlignedSqspiRam([0; 0x3D40])).0,
-        p.P2_06, // sck
-        p.P2_05, // csn
-        p.P2_07, // io0
-        p.P2_04, // io1
-        p.P2_01, // io2
-        p.P2_00, // io3
+        p.SQSPI, Irqs, SQSPI_FW, sqspi_mem, // periphs + ram
+        p.P2_06,   // sck
+        p.P2_05,   // csn
+        p.P2_07,   // io0
+        p.P2_04,   // io1
+        p.P2_01,   // io2
+        p.P2_00,   // io3
         config,
     ));
 
     info!("sQSPI driver initialized successfully");
 
+    /*
     // Read JEDEC ID first to verify communication.
     info!("reading JEDEC ID (opcode 0x9F)...");
     let mut jedec = [0u8; 3];
@@ -66,13 +71,14 @@ async fn main(_spawner: Spawner) {
     );
     if jedec[0] == 0x00 || jedec[0] == 0xFF {
         warn!("JEDEC ID looks invalid (0x00 or 0xFF) - check SPI wiring/config");
-    }
+    }*/
 
     // Read status register.
     info!("reading status register (opcode 0x05)...");
     let mut status = [0u8; 1];
-    unwrap!(sqspi.custom_instruction(0x05, &[], &mut status).await);
+    unwrap!(sqspi.blocking_custom_instruction(0x05, &[], &mut status));
     info!("status register: 0x{:02x}", status[0]);
+    /*
 
     // Read 256 bytes from flash address 0x0000.
     info!("reading 256 bytes from address 0x0000...");
@@ -92,9 +98,8 @@ async fn main(_spawner: Spawner) {
     info!("erase done");
 
     info!("all operations completed successfully");
-    loop {
-        cortex_m::asm::wfe();
-    }
+     */
+    loop {}
 }
 
 static SQSPI_FW: &[u8] = &[

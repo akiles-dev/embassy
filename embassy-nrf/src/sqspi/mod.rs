@@ -13,6 +13,7 @@ mod regs;
 
 use core::future::poll_fn;
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::ptr;
 use core::task::Poll;
 
@@ -152,7 +153,6 @@ pub enum SpiLines {
     Quad1_4_4,
 }
 
-
 /// sQSPI driver configuration.
 #[non_exhaustive]
 pub struct Config {
@@ -264,7 +264,7 @@ impl<'d> Sqspi<'d> {
         _sqspi: Peri<'d, T>,
         _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         firmware: &[u8],
-        ram: &'d mut [u8],
+        ram: &'d mut [MaybeUninit<u8>],
         sck: Peri<'d, impl GpioPin>,
         csn: Peri<'d, impl GpioPin>,
         io0: Peri<'d, impl GpioPin>,
@@ -277,6 +277,13 @@ impl<'d> Sqspi<'d> {
         let vpr = T::vpr_regs();
         let state = T::state();
 
+        // Zero the entire RAM buffer. The VPR firmware expects zeroed
+        // execution RAM, and the buffer may contain stale data (e.g. from
+        // a NOLOAD linker section or a previous run).
+        unsafe {
+            ptr::write_bytes(ram.as_mut_ptr(), 0, ram.len());
+        }
+
         // The VPR INITPC register requires 128-byte alignment (lower 7 bits
         // are ignored by hardware). Align the usable RAM start upward.
         let raw_base = ram.as_mut_ptr() as usize;
@@ -287,10 +294,19 @@ impl<'d> Sqspi<'d> {
         // Validate RAM buffer is large enough.
         let shared_ram_offset = meta.fw_shared_ram_addr_offset as usize;
         let code_size = meta.code_size_bytes();
-        let needed = shared_ram_offset + regs::Regs::SIZE + code_size;
+        let needed = meta.ram_total_bytes(); // fw_ram_total_size << 4                                                                                                                                                                                                                     
+        if usable_len < needed {
+            return Err(Error::BufferTooSmall);
+        }
         info!(
             "fw metadata: self_boot={}, code_size={}, shared_ram_offset={}, needed={}, ram_len={} (usable={}, align_pad={})",
-            meta.self_boot, code_size, shared_ram_offset, needed, ram.len(), usable_len, alignment_pad
+            meta.self_boot,
+            code_size,
+            shared_ram_offset,
+            needed,
+            ram.len(),
+            usable_len,
+            alignment_pad
         );
         if usable_len < needed {
             return Err(Error::BufferTooSmall);
@@ -306,7 +322,9 @@ impl<'d> Sqspi<'d> {
         let sp_regs = unsafe { regs::Regs::from_ptr(reg_ptr) };
         info!(
             "ram_base=0x{:08x}, reg_base=0x{:08x}, vpr_base=0x{:08x}",
-            ram_base, reg_base, vpr.as_ptr() as u32
+            ram_base,
+            reg_base,
+            vpr.as_ptr() as u32
         );
 
         // Grant secure access to the VPR00 peripheral via SPU00.
@@ -328,6 +346,7 @@ impl<'d> Sqspi<'d> {
         // Set ENABLE = 1, firmware will clear it when ready.
         // See `nrf_sqspi.c` line 156: nrf_qspi2_enable(p_qspi->p_reg)
         sp_regs.enable().write_value(1);
+        info!("ENABLE set to 1, readback={}", sp_regs.enable().read());
 
         // Compute VPR init PC.
         // See `nrf_sqspi.c` line 158-159.
@@ -339,7 +358,10 @@ impl<'d> Sqspi<'d> {
             let copy_len = firmware.len().min(code_size);
             info!(
                 "copying {} of {} bytes of firmware to 0x{:08x} (code_size={})",
-                copy_len, firmware.len(), vpr_init_pc, code_size
+                copy_len,
+                firmware.len(),
+                vpr_init_pc,
+                code_size
             );
             unsafe {
                 // Zero the entire code region first. The firmware binary may be
@@ -351,17 +373,58 @@ impl<'d> Sqspi<'d> {
             }
         }
 
+        // Verify first 4 words of copied firmware match the source.
+        info!(
+            "firmware verify: src[0..4]=[0x{:02x},0x{:02x},0x{:02x},0x{:02x}], ram[0..4]=[0x{:02x},0x{:02x},0x{:02x},0x{:02x}]",
+            firmware[0],
+            firmware[1],
+            firmware[2],
+            firmware[3],
+            unsafe { *(vpr_init_pc as *const u8) },
+            unsafe { *(vpr_init_pc as *const u8).add(1) },
+            unsafe { *(vpr_init_pc as *const u8).add(2) },
+            unsafe { *(vpr_init_pc as *const u8).add(3) },
+        );
+
+        // Read SPU00 permission for VPR00 (periph 0xC).
+        let spu_perm = pac::SPU00.periph(0xC).perm().read();
+        info!(
+            "SPU00 periph 0xC perm: secattr={}, dmasec={}",
+            spu_perm.secattr(),
+            spu_perm.dmasec(),
+        );
+
         // Start the VPR co-processor.
         // See `nrf_sqspi.c` lines 166-173.
+        info!("setting VPR INITPC=0x{:08x}, starting VPR", vpr_init_pc as u32);
         vpr.initpc().write_value(vpr_init_pc as u32);
         vpr.cpurun().write(|w| w.set_en(pac::vpr::vals::CpurunEn::RUNNING));
 
+        // Verify VPR is running.
+        let cpurun_val = unsafe { (vpr.cpurun().as_ptr() as *const u32).read_volatile() };
+        info!("VPR CPURUN readback=0x{:08x}", cpurun_val);
+
+        info!("waiting for firmware ready (ENABLE cleared)");
         // Wait for firmware to become ready (ENABLE goes from 1 to 0).
         // See `nrf_sqspi.c` lines 175-178.
-        while sp_regs.enable().read() != 0 {}
-        info!("firmware ready (ENABLE cleared)");
+        let mut wait_count: u32 = 0;
+        loop {
+            let enable_val = sp_regs.enable().read();
+            if enable_val == 0 {
+                break;
+            }
+            wait_count += 1;
+            if wait_count % 1_000_000 == 0 {
+                let cpurun_now = unsafe { (vpr.cpurun().as_ptr() as *const u32).read_volatile() };
+                warn!(
+                    "still waiting for ENABLE to clear: enable={}, cpurun=0x{:08x}, wait_count={}",
+                    enable_val, cpurun_now, wait_count
+                );
+            }
+        }
+        info!("firmware ready (ENABLE cleared) after {} iterations", wait_count);
 
-        // Configure GPIO pins AFTER firmware init, matching C driver order.
+        // Configure GPIO pins AFTER firmware is ready, matching C driver order.
         // See `nrf_sqspi.c` lines 184-241 (init) and 354-387 (dev_cfg).
         // SCK: output, no pull.
         Self::config_pin_output(&*sck, gpiovals::Pull::DISABLED);
@@ -383,7 +446,8 @@ impl<'d> Sqspi<'d> {
 
         // Enable sQSPI interrupt events (soft peripheral register, not VPR INTENSET).
         // See `nrf_sqspi.c` lines 251-255: enable DMA_DONE, DMA_ABORTED, DMA_DONEJOB.
-        sp_regs.intenset().write_value((1 << 5) | (1 << 8) | (1 << 4));
+        //        sp_regs.intenset().write_value((1 << 5) | (1 << 8) | (1 << 4));
+        sp_regs.intenset().write_value((1 << 9) | (1 << 12) | (1 << 5));
 
         // ---- Phase 2: Configure device (nrf_sqspi_dev_cfg) ----
 
@@ -513,7 +577,8 @@ impl<'d> Sqspi<'d> {
         if pac_ptr as u32 != expected_ptr as u32 {
             warn!(
                 "vpr_trigger_task: ADDRESS MISMATCH! pac=0x{:08x} vs expected=0x{:08x} (diff={})",
-                pac_ptr as u32, expected_ptr as u32,
+                pac_ptr as u32,
+                expected_ptr as u32,
                 pac_ptr as i32 - expected_ptr as i32
             );
         }
@@ -536,10 +601,10 @@ impl<'d> Sqspi<'d> {
         trace!("xsb: task_idx={}, task_count={}", task_idx, self.task_count);
         spsync.aux(0).write_value(self.task_count);
         // DMB ensures the AUX[0] write is visible to the VPR core before we
-        // trigger the task.  The C driver does this via sp_handshake_set().
+        // rigger the task.  The C driver does this via sp_handshake_set().
+        let mut spin_count = 0;
         cortex_m::asm::dmb();
         self.vpr_trigger_task(task_idx);
-        let mut spin_count: u32 = 0;
         loop {
             let a0 = spsync.aux(0).read();
             let a1 = spsync.aux(1).read();
@@ -550,7 +615,7 @@ impl<'d> Sqspi<'d> {
             cortex_m::asm::nop();
             cortex_m::asm::nop();
             spin_count += 1;
-            if spin_count % 1_000_000 == 0 {
+            if spin_count % 1_000 == 0 {
                 let cpurun_ptr = self.vpr.cpurun().as_ptr() as *const u32;
                 let cpurun_val = unsafe { cpurun_ptr.read_volatile() };
                 let dmstatus_ptr = self.vpr.debugif().dmstatus().as_ptr() as *const u32;
@@ -623,6 +688,9 @@ impl<'d> Sqspi<'d> {
             "start_transfer: opcode=0x{:02x}, addr=0x{:08x}, data_ptr=0x{:08x}, len={}, dir={}",
             opcode, address, data_ptr as u32, data_len, dir as u32
         );
+        self.regs.events_dma().done().write_value(0);
+        self.regs.events_dma().aborted().write_value(0);
+        self.regs.events_dma().events_done().job().write_value(0);
 
         let sp = self.regs;
         let core = sp.core();
@@ -713,7 +781,17 @@ impl<'d> Sqspi<'d> {
                 "wait_done poll: done={}, aborted={}, donejob={}",
                 done, aborted, donejob
             );
-            if done != 0 {
+            if donejob != 0 {
+                self.regs.events_dma().events_done().job().write_value(0);
+                trace!("wait_donejob: pending");
+                Poll::Pending
+            } else if aborted != 0 {
+                if aborted != 0 {
+                    warn!("wait_done: DMA ABORTED event detected!");
+                }
+                trace!("wait_done: pending");
+                Poll::Pending
+            } else if done != 0 {
                 // Clear the event and disable the core.
                 // See `nrf_sqspi.c` lines 761-764.
                 self.regs.events_dma().done().write_value(0);
@@ -722,10 +800,6 @@ impl<'d> Sqspi<'d> {
                 info!("wait_done: DMA DONE received");
                 Poll::Ready(())
             } else {
-                if aborted != 0 {
-                    warn!("wait_done: DMA ABORTED event detected!");
-                }
-                trace!("wait_done: pending");
                 Poll::Pending
             }
         })
@@ -807,7 +881,12 @@ impl<'d> Sqspi<'d> {
 
     /// Execute a custom SPI instruction.
     pub async fn custom_instruction(&mut self, opcode: u8, req: &[u8], resp: &mut [u8]) -> Result<(), Error> {
-        info!("custom_instruction: opcode=0x{:02x}, req_len={}, resp_len={}", opcode, req.len(), resp.len());
+        info!(
+            "custom_instruction: opcode=0x{:02x}, req_len={}, resp_len={}",
+            opcode,
+            req.len(),
+            resp.len()
+        );
         let dir = if !resp.is_empty() {
             TransferDir::RxOnly
         } else {

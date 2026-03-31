@@ -62,8 +62,10 @@ impl Regs {
         self.ptr as _
     }
 
-    /// Total size of the `NRF_SP_QSPI_Type` register block in bytes.
-    pub const SIZE: usize = 0x1B8;
+    /// Total size of the virtual register interface in bytes.
+    /// The C struct `NRF_SP_QSPI_Type` is 0x1B8 bytes, but the documented
+    /// register region reservation is 0x200 bytes.
+    pub const SIZE: usize = 0x200;
 
     /// `TASKS_START` - Start operation (offset 0x000, write-only).
     /// See `nrf_sp_qspi.h`: `NRF_SP_QSPI_Type.TASKS_START`.
