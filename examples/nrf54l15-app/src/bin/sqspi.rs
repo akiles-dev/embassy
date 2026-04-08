@@ -12,13 +12,14 @@ use {defmt_rtt as _, panic_probe as _};
 // Replace this path with your actual sQSPI firmware binary.
 
 bind_interrupts!(struct Irqs {
-    VPR00 => sqspi::InterruptHandler<peripherals::SQSPI>;
+    VPR00 => sqspi::InterruptHandler<peripherals::VPR>;
 });
 
+/*
 unsafe extern "C" {
     static __start_sqspi: u8;
     static __end_sqspi: u8;
-}
+}*/
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -40,15 +41,17 @@ async fn main(_spawner: Spawner) {
     );
 
     let sqspi_mem = unsafe {
-        let sqspi_start = &__start_sqspi as *const u8 as *mut MaybeUninit<u8>;
-        let sqspi_end = &__end_sqspi as *const u8 as *mut MaybeUninit<u8>;
+        let __start_sqspi = 0x20020000;
+        let __end_sqspi = 0x20030000;
+        let sqspi_start = __start_sqspi as *const u8 as *mut MaybeUninit<u8>;
+        let sqspi_end = __end_sqspi as *const u8 as *mut MaybeUninit<u8>;
         let sqspi_len = sqspi_end.offset_from(sqspi_start) as usize;
         slice::from_raw_parts_mut(sqspi_start, sqspi_len)
     };
 
     info!("initializing sQSPI driver...");
     let mut sqspi = unwrap!(sqspi::Sqspi::new(
-        p.SQSPI, Irqs, SQSPI_FW, sqspi_mem, // periphs + ram
+        p.VPR, Irqs, SQSPI_FW, sqspi_mem, // periphs + ram
         p.P2_06,   // sck
         p.P2_05,   // csn
         p.P2_07,   // io0

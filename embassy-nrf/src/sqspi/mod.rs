@@ -486,11 +486,11 @@ impl<'d> Sqspi<'d> {
         );
 
         // Dump first 16 words of the register region for layout verification.
-        for i in 0..16 {
-            let addr = reg_base + i * 4;
-            let val = unsafe { (addr as *const u32).read_volatile() };
-            trace!("reg[0x{:03x}] @ 0x{:08x} = 0x{:08x}", i * 4, addr, val);
-        }
+        //for i in 0..16 {
+        //    let addr = reg_base + i * 4;
+        //    let val = unsafe { (addr as *const u32).read_volatile() };
+        //    trace!("reg[0x{:03x}] @ 0x{:08x} = 0x{:08x}", i * 4, addr, val);
+        //}
 
         // ---- Phase 3: Activate (nrf_sqspi_activate) ----
 
@@ -899,6 +899,29 @@ impl<'d> Sqspi<'d> {
         };
         self.start_transfer(opcode, 0, data_ptr, data_len, dir);
         self.wait_done().await;
+        Ok(())
+    }
+
+    /// Execute a custom SPI instruction, blocking version
+    pub fn blocking_custom_instruction(&mut self, opcode: u8, req: &[u8], resp: &mut [u8]) -> Result<(), Error> {
+        info!(
+            "custom_instruction: opcode=0x{:02x}, req_len={}, resp_len={}",
+            opcode,
+            req.len(),
+            resp.len()
+        );
+        let dir = if !resp.is_empty() {
+            TransferDir::RxOnly
+        } else {
+            TransferDir::TxOnly
+        };
+        let (data_ptr, data_len) = if !resp.is_empty() {
+            (resp.as_mut_ptr(), resp.len())
+        } else {
+            (req.as_ptr() as *mut u8, req.len())
+        };
+        self.start_transfer(opcode, 0, data_ptr, data_len, dir);
+        self.blocking_wait_done();
         Ok(())
     }
 
