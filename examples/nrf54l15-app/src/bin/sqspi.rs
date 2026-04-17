@@ -3,9 +3,9 @@
 
 use core::mem::MaybeUninit;
 use core::slice;
-use defmt::{info, unwrap, warn};
+use defmt::{error, info, unwrap, warn};
 use embassy_executor::Spawner;
-use embassy_nrf::{bind_interrupts, pac, peripherals, sqspi};
+use embassy_nrf::{bind_interrupts, peripherals, sqspi};
 use {defmt_rtt as _, panic_probe as _};
 
 // The firmware binary for the FLPR core (compiled RISC-V code).
@@ -21,13 +21,16 @@ unsafe extern "C" {
     static __end_sqspi: u8;
 }*/
 
-#[embassy_executor::main]
-async fn main(_spawner: Spawner) {
-    let mut nrf_config = embassy_nrf::config::Config::default();
-    nrf_config.clock_speed = embassy_nrf::config::ClockSpeed::CK128;
-    let p = embassy_nrf::init(nrf_config);
-    embassy_time::Timer::after_secs(2).await;
+const PAGE_SIZE: usize = 4096;
 
+#[repr(C, align(4))]
+struct AlignedBuf([u8; 4096]);
+
+#[cortex_m_rt::entry]
+fn main() -> ! {
+    let mut config = embassy_nrf::config::Config::default();
+    //    config.clock_speed = embassy_nrf::config::ClockSpeed::CK64;
+    let p = embassy_nrf::init(config);
     info!("sQSPI example starting");
     info!("firmware size: {} bytes", SQSPI_FW.len());
 
@@ -35,74 +38,75 @@ async fn main(_spawner: Spawner) {
     config.frequency = sqspi::Frequency::M8;
     config.spi_mode = sqspi::MODE_0;
     config.lines = sqspi::SpiLines::Quad1_1_4;
-    info!(
-        "config: frequency=M8, lines=Quad1_1_4, addr=24bit, read_opcode=0x{:02x}, write_opcode=0x{:02x}",
-        config.read_opcode, config.write_opcode
-    );
 
     let sqspi_mem = unsafe {
-        let __start_sqspi = 0x20020000;
-        let __end_sqspi = 0x20030000;
-        let sqspi_start = __start_sqspi as *const u8 as *mut MaybeUninit<u8>;
-        let sqspi_end = __end_sqspi as *const u8 as *mut MaybeUninit<u8>;
-        let sqspi_len = sqspi_end.offset_from(sqspi_start) as usize;
+        let sqspi_start = 0x2003C000 as *mut MaybeUninit<u8>;
+        let sqspi_len: usize = 0x2003FE00 - 0x2003C000;
         slice::from_raw_parts_mut(sqspi_start, sqspi_len)
     };
 
     info!("initializing sQSPI driver...");
-    let mut sqspi = unwrap!(sqspi::Sqspi::new(
-        p.VPR, Irqs, SQSPI_FW, sqspi_mem, // periphs + ram
-        p.P2_06,   // sck
-        p.P2_05,   // csn
-        p.P2_07,   // io0
-        p.P2_04,   // io1
-        p.P2_01,   // io2
-        p.P2_00,   // io3
+    let mut q = unwrap!(sqspi::Sqspi::new(
+        p.VPR, Irqs, SQSPI_FW, sqspi_mem, p.P2_01, // sck
+        p.P2_05, // csn
+        p.P2_02, // io0
+        p.P2_04, // io1
+        p.P2_03, // io2
+        p.P2_00, // io3
         config,
     ));
 
     info!("sQSPI driver initialized successfully");
 
-    /*
-    // Read JEDEC ID first to verify communication.
-    info!("reading JEDEC ID (opcode 0x9F)...");
-    let mut jedec = [0u8; 3];
-    unwrap!(sqspi.custom_instruction(0x9F, &[], &mut jedec).await);
-    info!(
-        "JEDEC ID: manufacturer=0x{:02x}, mem_type=0x{:02x}, capacity=0x{:02x}",
-        jedec[0], jedec[1], jedec[2]
-    );
-    if jedec[0] == 0x00 || jedec[0] == 0xFF {
-        warn!("JEDEC ID looks invalid (0x00 or 0xFF) - check SPI wiring/config");
-    }*/
-
-    // Read status register.
-    info!("reading status register (opcode 0x05)...");
-    let mut status = [0u8; 1];
-    unwrap!(sqspi.blocking_custom_instruction(0x05, &[], &mut status));
-    info!("status register: 0x{:02x}", status[0]);
-    /*
-
-    // Read 256 bytes from flash address 0x0000.
-    info!("reading 256 bytes from address 0x0000...");
-    let mut buf = [0u8; 256];
-    unwrap!(sqspi.read(0x0000, &mut buf).await);
-    info!("read first 16 bytes: {:02x}", &buf[..16]);
-    info!("read last 16 bytes:  {:02x}", &buf[240..256]);
-
-    // Write 256 bytes to flash address 0x1000.
-    info!("writing 256 bytes to address 0x1000...");
-    unwrap!(sqspi.write(0x1000, &buf).await);
-    info!("write done");
-
-    // Erase a 4KB sector.
-    info!("erasing 4KB sector at address 0x2000...");
-    unwrap!(sqspi.erase(0x2000).await);
-    info!("erase done");
-
-    info!("all operations completed successfully");
-     */
+    // Read ID
+    let mut id = [1; 3];
+    unwrap!(q.blocking_custom_instruction(0x9F, &[], &mut id));
+    info!("id: {}", id);
     loop {}
+
+    /*
+    // Read status register to verify communication.
+    info!("reading status register...");
+    let mut status = [0u8; 1];
+    unwrap!(q.blocking_custom_instruction(0x05, &[], &mut status));
+    info!("status register: 0x{:02x}", status[0]);
+
+    if status[0] & 0x40 == 0 {
+        status[0] |= 0x40;
+
+        unwrap!(q.blocking_custom_instruction(0x01, &status, &mut []));
+
+        warn!("enabled quad in status");
+    }
+
+    let mut buf = AlignedBuf([0u8; PAGE_SIZE]);
+
+    let pattern = |a: u32| (a ^ (a >> 8) ^ (a >> 16) ^ (a >> 24)) as u8;
+
+    for i in 0..8 {
+        info!("page {:?}: erasing... ", i);
+        unwrap!(q.blocking_erase(i * PAGE_SIZE as u32));
+
+        for j in 0..PAGE_SIZE {
+            buf.0[j] = pattern((j as u32 + i * PAGE_SIZE as u32) as u32);
+        }
+
+        info!("programming...");
+        unwrap!(q.blocking_write(i * PAGE_SIZE as u32, &buf.0));
+    }
+
+    for i in 0..8 {
+        info!("page {:?}: reading... ", i);
+        unwrap!(q.blocking_read(i * PAGE_SIZE as u32, &mut buf.0));
+
+        info!("verifying...");
+        for j in 0..PAGE_SIZE {
+            assert_eq!(buf.0[j], pattern((j as u32 + i * PAGE_SIZE as u32) as u32));
+        }
+    }
+
+    info!("done!");
+    loop {}*/
 }
 
 static SQSPI_FW: &[u8] = &[

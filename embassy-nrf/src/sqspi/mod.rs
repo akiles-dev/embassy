@@ -277,6 +277,14 @@ impl<'d> Sqspi<'d> {
         let vpr = T::vpr_regs();
         let state = T::state();
 
+        // Grant secure access to the VPR00 peripheral via SPU00.
+        // VPR00 is peripheral index 0xC in SPU00.
+        // See `sqspi_nrf54L_series_porting_v1_2_1.rst` line 114.
+        pac::SPU00.periph(0xC).perm().write(|w| {
+            w.set_secattr(true);
+            w.set_dmasec(true);
+        });
+
         // Zero the entire RAM buffer. The VPR firmware expects zeroed
         // execution RAM, and the buffer may contain stale data (e.g. from
         // a NOLOAD linker section or a previous run).
@@ -294,7 +302,7 @@ impl<'d> Sqspi<'d> {
         // Validate RAM buffer is large enough.
         let shared_ram_offset = meta.fw_shared_ram_addr_offset as usize;
         let code_size = meta.code_size_bytes();
-        let needed = meta.ram_total_bytes(); // fw_ram_total_size << 4                                                                                                                                                                                                                     
+        let needed = code_size + meta.ram_total_bytes();
         if usable_len < needed {
             return Err(Error::BufferTooSmall);
         }
@@ -312,6 +320,10 @@ impl<'d> Sqspi<'d> {
             return Err(Error::BufferTooSmall);
         }
 
+        pac::MEMCONF.power(0).ret2().write(|w| {
+            w.set_mem7(true);
+        });
+
         // Compute register base address.
         // Layout: [alignment pad | firmware code | execution RAM | register interface]
         // reg_base = aligned_base + code_size + shared_ram_offset
@@ -327,13 +339,12 @@ impl<'d> Sqspi<'d> {
             vpr.as_ptr() as u32
         );
 
-        // Grant secure access to the VPR00 peripheral via SPU00.
-        // VPR00 is peripheral index 0xC in SPU00.
-        // See `sqspi_nrf54L_series_porting_v1_2_1.rst` line 114.
-        pac::SPU00.periph(0xC).perm().write(|w| {
-            w.set_secattr(true);
-            w.set_dmasec(true);
-        });
+        let vpr_init_pc_orig = reg_base - shared_ram_offset - code_size;
+
+        // Compute VPR init PC.
+        // See `nrf_sqspi.c` line 158-159.
+        let vpr_init_pc = ram_base;
+        assert_eq!(vpr_init_pc, vpr_init_pc_orig);
 
         // ---- Phase 1: Load and start firmware (nrf_sqspi_init) ----
 
@@ -342,15 +353,6 @@ impl<'d> Sqspi<'d> {
         unsafe {
             ptr::write_bytes(reg_ptr as *mut u8, 0, regs::Regs::SIZE);
         }
-
-        // Set ENABLE = 1, firmware will clear it when ready.
-        // See `nrf_sqspi.c` line 156: nrf_qspi2_enable(p_qspi->p_reg)
-        sp_regs.enable().write_value(1);
-        info!("ENABLE set to 1, readback={}", sp_regs.enable().read());
-
-        // Compute VPR init PC.
-        // See `nrf_sqspi.c` line 158-159.
-        let vpr_init_pc = ram_base;
 
         // Copy firmware to RAM if not self-boot.
         // See `nrf_sqspi.c` lines 161-164.
@@ -386,13 +388,19 @@ impl<'d> Sqspi<'d> {
             unsafe { *(vpr_init_pc as *const u8).add(3) },
         );
 
-        // Read SPU00 permission for VPR00 (periph 0xC).
-        let spu_perm = pac::SPU00.periph(0xC).perm().read();
-        info!(
-            "SPU00 periph 0xC perm: secattr={}, dmasec={}",
-            spu_perm.secattr(),
-            spu_perm.dmasec(),
-        );
+        // Set ENABLE = 1, firmware will clear it when ready.
+        // See `nrf_sqspi.c` line 156: nrf_qspi2_enable(p_qspi->p_reg)
+        sp_regs.enable().write_value(1);
+        info!("ENABLE set to 1, readback={}", sp_regs.enable().read());
+
+        // Grant FLPR access to MEMCONF via SPU20 (periph index 0xF).
+        // Required for proper sQSPI deactivate/power management.
+        // See `sqspi_nrf54L_series_porting_v1_2_1.rst` lines 96-97.
+        /*
+        pac::SPU00.periph(0xF).perm().write(|w| {
+            w.set_secattr(true);
+            w.set_dmasec(true);
+        });*/
 
         // Start the VPR co-processor.
         // See `nrf_sqspi.c` lines 166-173.
@@ -401,8 +409,8 @@ impl<'d> Sqspi<'d> {
         vpr.cpurun().write(|w| w.set_en(pac::vpr::vals::CpurunEn::RUNNING));
 
         // Verify VPR is running.
-        let cpurun_val = unsafe { (vpr.cpurun().as_ptr() as *const u32).read_volatile() };
-        info!("VPR CPURUN readback=0x{:08x}", cpurun_val);
+        let cpurun_val = vpr.cpurun().read().en().to_bits();
+        info!("VPR CPURUN readback={:?}", cpurun_val);
 
         info!("waiting for firmware ready (ENABLE cleared)");
         // Wait for firmware to become ready (ENABLE goes from 1 to 0).
@@ -415,14 +423,20 @@ impl<'d> Sqspi<'d> {
             }
             wait_count += 1;
             if wait_count % 1_000_000 == 0 {
-                let cpurun_now = unsafe { (vpr.cpurun().as_ptr() as *const u32).read_volatile() };
+                let cpurun_now = vpr.cpurun().read().en().to_bits();
+                info!("VPR CPURUN readback={:?}", cpurun_val);
                 warn!(
-                    "still waiting for ENABLE to clear: enable={}, cpurun=0x{:08x}, wait_count={}",
+                    "still waiting for ENABLE to clear: enable={}, cpurun={:?}, wait_count={}",
                     enable_val, cpurun_now, wait_count
                 );
             }
         }
         info!("firmware ready (ENABLE cleared) after {} iterations", wait_count);
+
+        // Tell the VPR to stay stopped after the next core reset. The VPR
+        // keeps running right now, but on the next reset it will not
+        // auto-start from stale RAM.
+        vpr.cpurun().write(|w| w.set_en(pac::vpr::vals::CpurunEn::STOPPED));
 
         // Configure GPIO pins AFTER firmware is ready, matching C driver order.
         // See `nrf_sqspi.c` lines 184-241 (init) and 354-387 (dev_cfg).
@@ -521,8 +535,8 @@ impl<'d> Sqspi<'d> {
 
         // Enable VPR interrupt AFTER ASB, matching C driver order.
         // See `nrf_sqspi.c` line 515: NRFX_IRQ_ENABLE(SP_VPR_IRQn)
-        T::Interrupt::unpend();
-        unsafe { T::Interrupt::enable() };
+        //T::Interrupt::unpend();
+        //unsafe { T::Interrupt::enable() };
         info!("init complete");
 
         Ok(driver)
@@ -600,11 +614,8 @@ impl<'d> Sqspi<'d> {
         let spsync = self.regs.spsync();
         trace!("xsb: task_idx={}, task_count={}", task_idx, self.task_count);
         spsync.aux(0).write_value(self.task_count);
-        // DMB ensures the AUX[0] write is visible to the VPR core before we
-        // rigger the task.  The C driver does this via sp_handshake_set().
-        let mut spin_count = 0;
-        cortex_m::asm::dmb();
         self.vpr_trigger_task(task_idx);
+        let mut spin_count: u32 = 0;
         loop {
             let a0 = spsync.aux(0).read();
             let a1 = spsync.aux(1).read();
@@ -615,30 +626,19 @@ impl<'d> Sqspi<'d> {
             cortex_m::asm::nop();
             cortex_m::asm::nop();
             spin_count += 1;
-            if spin_count % 1_000 == 0 {
-                let cpurun_ptr = self.vpr.cpurun().as_ptr() as *const u32;
-                let cpurun_val = unsafe { cpurun_ptr.read_volatile() };
-                let dmstatus_ptr = self.vpr.debugif().dmstatus().as_ptr() as *const u32;
-                let dmstatus_val = unsafe { dmstatus_ptr.read_volatile() };
-                // Read EVENTS_TRIGGERED for indices 16..21 to check VPR event state.
-                let mut evts = [0u32; 6];
-                for i in 0..6 {
-                    evts[i] = self.vpr.events_triggered(16 + i).read();
-                }
+            // Re-trigger the task periodically in case the first trigger was missed.
+            if spin_count % 10_000 == 0 {
+                self.vpr_trigger_task(task_idx);
+            }
+            if spin_count % 100_000 == 0 {
                 warn!(
-                    "xsb: STUCK task_idx={}, task_count={}, aux[0]={}, aux[1]={}, spins={}, enable={}, cpurun=0x{:08x}, dmstatus=0x{:08x}",
+                    "xsb: STUCK task_idx={}, task_count={}, aux[0]={}, aux[1]={}, spins={}, enable={}",
                     task_idx,
                     self.task_count,
                     a0,
                     a1,
                     spin_count,
                     self.regs.enable().read(),
-                    cpurun_val,
-                    dmstatus_val,
-                );
-                warn!(
-                    "xsb: events_triggered[16..21] = [{}, {}, {}, {}, {}, {}]",
-                    evts[0], evts[1], evts[2], evts[3], evts[4], evts[5]
                 );
             }
         }
@@ -683,10 +683,23 @@ impl<'d> Sqspi<'d> {
     ///
     /// Simplified from the C driver's `xfer_common` + `nrf_sqspi_xfer`
     /// (`nrf_sqspi.c` lines 553-706) for byte-oriented flash operations.
-    fn start_transfer(&mut self, opcode: u8, address: u32, data_ptr: *mut u8, data_len: usize, dir: TransferDir) {
+    /// Set up and start a flash transfer.
+    ///
+    /// Matches C driver's `xfer_common` + `nrf_sqspi_xfer` per-transfer
+    /// parameterization of address length, wait cycles, and line mode.
+    fn start_transfer(
+        &mut self,
+        opcode: u8,
+        address: u32,
+        addr_len_bits: u32,
+        wait_cycles: u32,
+        data_ptr: *mut u8,
+        data_len: usize,
+        dir: TransferDir,
+    ) {
         info!(
-            "start_transfer: opcode=0x{:02x}, addr=0x{:08x}, data_ptr=0x{:08x}, len={}, dir={}",
-            opcode, address, data_ptr as u32, data_len, dir as u32
+            "start_transfer: opcode=0x{:02x}, addr=0x{:08x}, addr_bits={}, wait={}, len={}, dir={}",
+            opcode, address, addr_len_bits, wait_cycles, data_len, dir as u32
         );
         self.regs.events_dma().done().write_value(0);
         self.regs.events_dma().aborted().write_value(0);
@@ -705,14 +718,13 @@ impl<'d> Sqspi<'d> {
         format.cilen().write_value(1);
 
         // CTRLR0: 8-bit frames, SPI mode, clock polarity/phase, transfer direction.
-        // See `nrf_sp_qspi.h`: `QSPI_CORE_CORE_CTRLR0_*` defines.
         let scph: u32 = match self.config.spi_mode.phase {
             Phase::CaptureOnFirstTransition => 0,
             Phase::CaptureOnSecondTransition => 1,
         };
         let scpol: u32 = match self.config.spi_mode.polarity {
-            Polarity::IdleLow => 1,  // INACTIVEHIGH
-            Polarity::IdleHigh => 0, // INACTIVELOW
+            Polarity::IdleLow => 0,  // INACTIVEHIGH (=0): idle low
+            Polarity::IdleHigh => 1, // INACTIVELOW (=1): idle high
         };
         let spi_frf: u32 = match self.config.lines {
             SpiLines::Single => 0,
@@ -729,18 +741,9 @@ impl<'d> Sqspi<'d> {
         trace!("CTRLR0=0x{:08x}", ctrlr0);
 
         // SPICTRLR0: multi-line mode, address length, 8-bit instruction, dummy cycles.
-        // See `nrf_sp_qspi.h`: `QSPI_CORE_CORE_SPICTRLR0_*` defines.
         let transtype: u32 = match self.config.lines {
             SpiLines::Single | SpiLines::Dual1_1_2 | SpiLines::Quad1_1_4 => 0,
             SpiLines::Dual1_2_2 | SpiLines::Quad1_4_4 => 1,
-        };
-        let addr_len_bits: u32 = match self.config.address_mode {
-            AddressMode::_24Bit => 24,
-            AddressMode::_32Bit => 32,
-        };
-        let wait_cycles: u32 = match self.config.lines {
-            SpiLines::Single => 0,
-            _ => 8,
         };
         let spictrlr0 = transtype
             | (((addr_len_bits / 4) & 0xF) << 2)   // ADDRL
@@ -755,17 +758,13 @@ impl<'d> Sqspi<'d> {
         core.dr(2).write_value(0); // Upper address bits (always 0 for 24/32-bit).
         core.dr(3).write_value(data_ptr as u32);
         core.dr(4).write_value(data_len as u32);
-        trace!(
-            "DR[0..4]: cmd=0x{:02x}, addr=0x{:08x}, upper=0, ptr=0x{:08x}, len={}",
-            opcode, address, data_ptr as u32, data_len
-        );
 
+        loop {}
         // Synchronize config, enable core, synchronize action, trigger transfer.
         self.csb();
         core.sqspienr().write_value(1);
-        trace!("SQSPIENR=1");
         self.asb();
-        info!("triggering DPPI_0 (task_idx={})", regs::SP_VPR_TASK_DPPI_0_IDX);
+
         self.vpr_trigger_task(regs::SP_VPR_TASK_DPPI_0_IDX);
     }
 
@@ -831,16 +830,35 @@ impl<'d> Sqspi<'d> {
     // Public API
     // ========================================================================
 
+    /// Address length in bits based on config.
+    fn addr_len_bits(&self) -> u32 {
+        match self.config.address_mode {
+            AddressMode::_24Bit => 24,
+            AddressMode::_32Bit => 32,
+        }
+    }
+
+    /// Wait/dummy cycles for read operations based on line mode.
+    fn read_wait_cycles(&self) -> u32 {
+        match self.config.lines {
+            SpiLines::Single => 0,
+            _ => 8,
+        }
+    }
+
     /// Read data from the flash memory.
     pub async fn read(&mut self, address: u32, data: &mut [u8]) -> Result<(), Error> {
-        info!("read: addr=0x{:08x}, len={}", address, data.len());
         if data.is_empty() {
             return Ok(());
         }
         self.bounds_check(address, data.len())?;
+        let addr_bits = self.addr_len_bits();
+        let wait = self.read_wait_cycles();
         self.start_transfer(
             self.config.read_opcode,
             address,
+            addr_bits,
+            wait,
             data.as_mut_ptr(),
             data.len(),
             TransferDir::RxOnly,
@@ -851,14 +869,16 @@ impl<'d> Sqspi<'d> {
 
     /// Write data to the flash memory.
     pub async fn write(&mut self, address: u32, data: &[u8]) -> Result<(), Error> {
-        info!("write: addr=0x{:08x}, len={}", address, data.len());
         if data.is_empty() {
             return Ok(());
         }
         self.bounds_check(address, data.len())?;
+        let addr_bits = self.addr_len_bits();
         self.start_transfer(
             self.config.write_opcode,
             address,
+            addr_bits,
+            0,
             data.as_ptr() as *mut u8,
             data.len(),
             TransferDir::TxOnly,
@@ -869,24 +889,18 @@ impl<'d> Sqspi<'d> {
 
     /// Erase a 4KB sector at the given address.
     pub async fn erase(&mut self, address: u32) -> Result<(), Error> {
-        info!("erase: addr=0x{:08x}", address);
         if self.config.capacity > 0 && address >= self.config.capacity {
             return Err(Error::OutOfBounds);
         }
-        // Sector erase command (0x20) with no data.
-        self.start_transfer(0x20, address, ptr::null_mut(), 0, TransferDir::TxOnly);
+        let addr_bits = self.addr_len_bits();
+        // Sector erase (0x20): no data, no dummy.
+        self.start_transfer(0x20, address, addr_bits, 0, ptr::null_mut(), 0, TransferDir::TxOnly);
         self.wait_done().await;
         Ok(())
     }
 
     /// Execute a custom SPI instruction.
     pub async fn custom_instruction(&mut self, opcode: u8, req: &[u8], resp: &mut [u8]) -> Result<(), Error> {
-        info!(
-            "custom_instruction: opcode=0x{:02x}, req_len={}, resp_len={}",
-            opcode,
-            req.len(),
-            resp.len()
-        );
         let dir = if !resp.is_empty() {
             TransferDir::RxOnly
         } else {
@@ -897,19 +911,14 @@ impl<'d> Sqspi<'d> {
         } else {
             (req.as_ptr() as *mut u8, req.len())
         };
-        self.start_transfer(opcode, 0, data_ptr, data_len, dir);
+        // Custom instructions: configured line mode, no address, no dummy.
+        self.start_transfer(opcode, 0, 0, 0, data_ptr, data_len, dir);
         self.wait_done().await;
         Ok(())
     }
 
     /// Execute a custom SPI instruction, blocking version
     pub fn blocking_custom_instruction(&mut self, opcode: u8, req: &[u8], resp: &mut [u8]) -> Result<(), Error> {
-        info!(
-            "custom_instruction: opcode=0x{:02x}, req_len={}, resp_len={}",
-            opcode,
-            req.len(),
-            resp.len()
-        );
         let dir = if !resp.is_empty() {
             TransferDir::RxOnly
         } else {
@@ -920,21 +929,25 @@ impl<'d> Sqspi<'d> {
         } else {
             (req.as_ptr() as *mut u8, req.len())
         };
-        self.start_transfer(opcode, 0, data_ptr, data_len, dir);
+        // Custom instructions: configured line mode, no address, no dummy.
+        self.start_transfer(opcode, 0, 0, 0, data_ptr, data_len, dir);
         self.blocking_wait_done();
         Ok(())
     }
 
     /// Read data from the flash memory, blocking version.
     pub fn blocking_read(&mut self, address: u32, data: &mut [u8]) -> Result<(), Error> {
-        info!("blocking_read: addr=0x{:08x}, len={}", address, data.len());
         if data.is_empty() {
             return Ok(());
         }
         self.bounds_check(address, data.len())?;
+        let addr_bits = self.addr_len_bits();
+        let wait = self.read_wait_cycles();
         self.start_transfer(
             self.config.read_opcode,
             address,
+            addr_bits,
+            wait,
             data.as_mut_ptr(),
             data.len(),
             TransferDir::RxOnly,
@@ -945,14 +958,16 @@ impl<'d> Sqspi<'d> {
 
     /// Write data to the flash memory, blocking version.
     pub fn blocking_write(&mut self, address: u32, data: &[u8]) -> Result<(), Error> {
-        info!("blocking_write: addr=0x{:08x}, len={}", address, data.len());
         if data.is_empty() {
             return Ok(());
         }
         self.bounds_check(address, data.len())?;
+        let addr_bits = self.addr_len_bits();
         self.start_transfer(
             self.config.write_opcode,
             address,
+            addr_bits,
+            0,
             data.as_ptr() as *mut u8,
             data.len(),
             TransferDir::TxOnly,
@@ -963,11 +978,12 @@ impl<'d> Sqspi<'d> {
 
     /// Erase a 4KB sector, blocking version.
     pub fn blocking_erase(&mut self, address: u32) -> Result<(), Error> {
-        info!("blocking_erase: addr=0x{:08x}", address);
         if self.config.capacity > 0 && address >= self.config.capacity {
             return Err(Error::OutOfBounds);
         }
-        self.start_transfer(0x20, address, ptr::null_mut(), 0, TransferDir::TxOnly);
+        let addr_bits = self.addr_len_bits();
+        // Sector erase (0x20): no data, no dummy.
+        self.start_transfer(0x20, address, addr_bits, 0, ptr::null_mut(), 0, TransferDir::TxOnly);
         self.blocking_wait_done();
         Ok(())
     }

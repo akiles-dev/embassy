@@ -148,16 +148,16 @@ pub mod pwm;
 #[cfg(not(feature = "_nrf54l"))] // TODO
 #[cfg(not(any(feature = "_nrf51", feature = "_nrf91", feature = "_nrf5340-net")))]
 pub mod qdec;
-#[cfg(any(feature = "nrf52840", feature = "_nrf5340-app", feature = "_nrf54l"))]
-pub mod qspi_common;
 #[cfg(not(feature = "_nrf54l"))] // TODO
 #[cfg(any(feature = "nrf52840", feature = "_nrf5340-app"))]
 pub mod qspi;
-#[cfg(feature = "_nrf54l")]
-pub mod sqspi;
+#[cfg(any(feature = "nrf52840", feature = "_nrf5340-app", feature = "_nrf54l"))]
+pub mod qspi_common;
 #[cfg(not(feature = "_nrf54l"))] // TODO
 #[cfg(not(any(feature = "_nrf91", feature = "_nrf5340-app")))]
 pub mod radio;
+#[cfg(feature = "_nrf54l")]
+pub mod sqspi;
 
 #[cfg(any(
     feature = "nrf52811",
@@ -780,6 +780,20 @@ pub fn init(config: config::Config) -> Peripherals {
         let regs = pac::OSCILLATORS_NS;
 
         use pac::oscillators::vals::Freq;
+
+        /*
+        // Enable the instruction cache before switching to 128 MHz.
+        // At 128 MHz the CPU is too fast for direct RRAM reads without caching.
+        if matches!(config.clock_speed, config::ClockSpeed::CK128) {
+            #[cfg(feature = "_s")]
+            {
+                pac::ICACHE_S.tasks_invalidatecache().write_value(1);
+                pac::ICACHE_S.enable().write(|w| w.set_enable(true));
+                cortex_m::asm::dsb();
+                cortex_m::asm::isb();
+            }
+        }*/
+
         regs.pll().freq().write(|w| {
             w.set_freq(match config.clock_speed {
                 config::ClockSpeed::CK64 => Freq::Ck64m,

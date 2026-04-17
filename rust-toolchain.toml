@@ -1,5 +1,5 @@
 [toolchain]
-channel = "1.92"
+channel = "1.94.1"
 components = [ "rust-src", "rustfmt", "llvm-tools" ]
 targets = [
     "thumbv7em-none-eabi",
@@ -7,6 +7,7 @@ targets = [
     "thumbv6m-none-eabi",
     "thumbv7em-none-eabihf",
     "thumbv8m.main-none-eabihf",
+    "thumbv8m.main-none-eabi",
     "riscv32imac-unknown-none-elf",
     "wasm32-unknown-unknown",
     "armv7a-none-eabi",
