@@ -67,8 +67,8 @@ impl Default for Config {
             frequency: Frequency::M8,
             sck_delay: 80,
             rx_delay: 2,
-            spi_mode: SpiMode::Mode0,
-            address_mode: AddressMode::_24bit,
+            spi_mode: MODE_0,
+            address_mode: AddressMode::_24Bit,
             capacity: 0,
         }
     }
@@ -147,8 +147,8 @@ impl<'d> Qspi<'d> {
 
         r.ifconfig0().write(|w| {
             w.set_addrmode(match config.address_mode {
-                AddressMode::_24Bit => Addrmode::_24BIT,
-                AddressMode::_32Bit => Addrmode::_32BIT,
+                AddressMode::_24Bit => Addrmode::_24bit,
+                AddressMode::_32Bit => Addrmode::_32bit,
             });
             w.set_dpmenable(config.deep_power_down.is_some());
             w.set_ppsize(config.write_page_size);
@@ -167,8 +167,8 @@ impl<'d> Qspi<'d> {
             w.set_sckdelay(config.sck_delay);
             w.set_dpmen(false);
             w.set_spimode(match (config.spi_mode.polarity, config.spi_mode.phase) {
-                (Polarity::IdleHigh, Phase::CaptureOnSecondTransition) => Spimode::MODE3,
-                _ => Spimode::MODE0,
+                (Polarity::IdleHigh, Phase::CaptureOnSecondTransition) => Spimode::Mode3,
+                _ => Spimode::Mode0,
             });
             w.set_sckfreq(config.frequency as u8);
         });

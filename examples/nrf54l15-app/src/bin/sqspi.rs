@@ -29,7 +29,7 @@ struct AlignedBuf([u8; 4096]);
 #[cortex_m_rt::entry]
 fn main() -> ! {
     let mut config = embassy_nrf::config::Config::default();
-    //    config.clock_speed = embassy_nrf::config::ClockSpeed::CK64;
+    config.clock_speed = embassy_nrf::config::ClockSpeed::CK128;
     let p = embassy_nrf::init(config);
     info!("sQSPI example starting");
     info!("firmware size: {} bytes", SQSPI_FW.len());

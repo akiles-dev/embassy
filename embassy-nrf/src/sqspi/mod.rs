@@ -23,7 +23,6 @@ use embedded_storage::nor_flash::{ErrorType, NorFlash, NorFlashError, NorFlashEr
 
 use crate::gpio::{self, Pin as GpioPin, SealedPin};
 use crate::interrupt;
-use crate::interrupt::typelevel::Interrupt;
 use crate::pac;
 use crate::pac::gpio::vals as gpiovals;
 pub use crate::qspi_common::*;
@@ -282,7 +281,7 @@ impl<'d> Sqspi<'d> {
         // See `sqspi_nrf54L_series_porting_v1_2_1.rst` line 114.
         pac::SPU00.periph(0xC).perm().write(|w| {
             w.set_secattr(true);
-            w.set_dmasec(true);
+            w.set_dmasec(pac::spu::vals::Dmasec::Secure);
         });
 
         // Zero the entire RAM buffer. The VPR firmware expects zeroed
@@ -406,7 +405,7 @@ impl<'d> Sqspi<'d> {
         // See `nrf_sqspi.c` lines 166-173.
         info!("setting VPR INITPC=0x{:08x}, starting VPR", vpr_init_pc as u32);
         vpr.initpc().write_value(vpr_init_pc as u32);
-        vpr.cpurun().write(|w| w.set_en(pac::vpr::vals::CpurunEn::RUNNING));
+        vpr.cpurun().write(|w| w.set_en(pac::vpr::vals::CpurunEn::Running));
 
         // Verify VPR is running.
         let cpurun_val = vpr.cpurun().read().en().to_bits();
@@ -436,19 +435,19 @@ impl<'d> Sqspi<'d> {
         // Tell the VPR to stay stopped after the next core reset. The VPR
         // keeps running right now, but on the next reset it will not
         // auto-start from stale RAM.
-        vpr.cpurun().write(|w| w.set_en(pac::vpr::vals::CpurunEn::STOPPED));
+        vpr.cpurun().write(|w| w.set_en(pac::vpr::vals::CpurunEn::Stopped));
 
         // Configure GPIO pins AFTER firmware is ready, matching C driver order.
         // See `nrf_sqspi.c` lines 184-241 (init) and 354-387 (dev_cfg).
         // SCK: output, no pull.
-        Self::config_pin_output(&*sck, gpiovals::Pull::DISABLED);
+        Self::config_pin_output(&*sck, gpiovals::Pull::Disabled);
         // IO0-IO3: output+input, pull-up.
-        Self::config_pin_io(&*io0, gpiovals::Pull::PULLUP);
-        Self::config_pin_io(&*io1, gpiovals::Pull::PULLUP);
-        Self::config_pin_io(&*io2, gpiovals::Pull::PULLUP);
-        Self::config_pin_io(&*io3, gpiovals::Pull::PULLUP);
+        Self::config_pin_io(&*io0, gpiovals::Pull::Pullup);
+        Self::config_pin_io(&*io1, gpiovals::Pull::Pullup);
+        Self::config_pin_io(&*io2, gpiovals::Pull::Pullup);
+        Self::config_pin_io(&*io3, gpiovals::Pull::Pullup);
         // CSN: output, no pull. Configured in dev_cfg() in C driver.
-        Self::config_pin_output(&*csn, gpiovals::Pull::DISABLED);
+        Self::config_pin_output(&*csn, gpiovals::Pull::Disabled);
 
         // Set up format for 8-bit flash frames (DFS=7, BPP=8, MSB-first, no padding).
         // See `nrf_sqspi.c` lines 243-247.
@@ -550,12 +549,12 @@ impl<'d> Sqspi<'d> {
     fn config_pin_output(pin: &impl SealedPin, pull: gpiovals::Pull) {
         pin.set_high();
         pin.conf().write(|w| {
-            w.set_dir(gpiovals::Dir::OUTPUT);
-            w.set_input(gpiovals::Input::DISCONNECT);
+            w.set_dir(gpiovals::Dir::Output);
+            w.set_input(gpiovals::Input::Disconnect);
             w.set_pull(pull);
             w.set_drive0(gpiovals::Drive::S);
             w.set_drive1(gpiovals::Drive::S);
-            w.set_ctrlsel(gpiovals::Ctrlsel::VPR);
+            w.set_ctrlsel(gpiovals::Ctrlsel::Vpr);
         });
     }
 
@@ -563,12 +562,12 @@ impl<'d> Sqspi<'d> {
     fn config_pin_io(pin: &impl SealedPin, pull: gpiovals::Pull) {
         pin.set_high();
         pin.conf().write(|w| {
-            w.set_dir(gpiovals::Dir::OUTPUT);
-            w.set_input(gpiovals::Input::CONNECT);
+            w.set_dir(gpiovals::Dir::Output);
+            w.set_input(gpiovals::Input::Connect);
             w.set_pull(pull);
             w.set_drive0(gpiovals::Drive::S);
             w.set_drive1(gpiovals::Drive::S);
-            w.set_ctrlsel(gpiovals::Ctrlsel::VPR);
+            w.set_ctrlsel(gpiovals::Ctrlsel::Vpr);
         });
     }
 
@@ -614,8 +613,13 @@ impl<'d> Sqspi<'d> {
         let spsync = self.regs.spsync();
         trace!("xsb: task_idx={}, task_count={}", task_idx, self.task_count);
         spsync.aux(0).write_value(self.task_count);
+        // Ensure the AUX[0] write (and any prior shared-RAM register writes)
+        // are drained before we trigger the VPR. Shared RAM is Normal memory
+        // while TASKS_TRIGGER is Device memory; ARMv8-M does not order them
+        // without an explicit barrier, and the FLPR would otherwise observe
+        // stale state when it services the trigger.
+        cortex_m::asm::dmb();
         self.vpr_trigger_task(task_idx);
-        let mut spin_count: u32 = 0;
         loop {
             let a0 = spsync.aux(0).read();
             let a1 = spsync.aux(1).read();
@@ -625,29 +629,10 @@ impl<'d> Sqspi<'d> {
             cortex_m::asm::nop();
             cortex_m::asm::nop();
             cortex_m::asm::nop();
-            spin_count += 1;
-            // Re-trigger the task periodically in case the first trigger was missed.
-            if spin_count % 10_000 == 0 {
-                self.vpr_trigger_task(task_idx);
-            }
-            if spin_count % 100_000 == 0 {
-                warn!(
-                    "xsb: STUCK task_idx={}, task_count={}, aux[0]={}, aux[1]={}, spins={}, enable={}",
-                    task_idx,
-                    self.task_count,
-                    a0,
-                    a1,
-                    spin_count,
-                    self.regs.enable().read(),
-                );
-            }
         }
-        trace!(
-            "xsb: done, aux[0]={}, aux[1]={}, spins={}",
-            spsync.aux(0).read(),
-            spsync.aux(1).read(),
-            spin_count
-        );
+        // Make any shared-RAM updates performed by the FLPR visible to
+        // subsequent reads on this core.
+        cortex_m::asm::dmb();
         self.task_count = self.task_count.wrapping_add(1);
     }
 
@@ -759,12 +744,14 @@ impl<'d> Sqspi<'d> {
         core.dr(3).write_value(data_ptr as u32);
         core.dr(4).write_value(data_len as u32);
 
-        loop {}
         // Synchronize config, enable core, synchronize action, trigger transfer.
         self.csb();
         core.sqspienr().write_value(1);
         self.asb();
 
+        // Drain the sqspienr write and any other Normal-memory writes before
+        // kicking the DPPI channel that starts the transfer on the FLPR.
+        cortex_m::asm::dmb();
         self.vpr_trigger_task(regs::SP_VPR_TASK_DPPI_0_IDX);
     }
 
@@ -791,6 +778,8 @@ impl<'d> Sqspi<'d> {
                 trace!("wait_done: pending");
                 Poll::Pending
             } else if done != 0 {
+                // Order the DONE observation before reading the buffer the FLPR wrote.
+                cortex_m::asm::dmb();
                 // Clear the event and disable the core.
                 // See `nrf_sqspi.c` lines 761-764.
                 self.regs.events_dma().done().write_value(0);
@@ -820,6 +809,8 @@ impl<'d> Sqspi<'d> {
                 );
             }
         }
+        // Order the DONE observation before reading the buffer the FLPR wrote.
+        cortex_m::asm::dmb();
         self.regs.events_dma().done().write_value(0);
         self.regs.core().sqspienr().write_value(0);
         self.asb();
@@ -1016,7 +1007,7 @@ impl<'d> Drop for Sqspi<'d> {
         self.asb();
 
         // Stop VPR.
-        self.vpr.cpurun().write(|w| w.set_en(pac::vpr::vals::CpurunEn::STOPPED));
+        self.vpr.cpurun().write(|w| w.set_en(pac::vpr::vals::CpurunEn::Stopped));
 
         // Reset VPR via DEBUGIF.DMCONTROL.
         // See `nrf_sqspi.c` lines 309-318.
