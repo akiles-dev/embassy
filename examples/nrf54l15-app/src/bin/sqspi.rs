@@ -34,10 +34,11 @@ fn main() -> ! {
     info!("sQSPI example starting");
     info!("firmware size: {} bytes", SQSPI_FW.len());
 
+    // Defaults are Quad1_4_4 with 0xEB/0x38 and 6 dummy cycles, matching the
+    // nRF52 QSPI driver. Override only what the board actually needs changed.
     let mut config = sqspi::Config::default();
     config.frequency = sqspi::Frequency::M8;
     config.spi_mode = sqspi::MODE_0;
-    config.lines = sqspi::SpiLines::Quad1_1_4;
 
     let sqspi_mem = unsafe {
         let sqspi_start = 0x2003C000 as *mut MaybeUninit<u8>;
@@ -62,21 +63,31 @@ fn main() -> ! {
     let mut id = [1; 3];
     unwrap!(q.blocking_custom_instruction(0x9F, &[], &mut id));
     info!("id: {}", id);
-    loop {}
 
-    /*
     // Read status register to verify communication.
+    // Bits (MX25R6435F): 7=SRWD, 6=QE, 5=BP3, 4=BP2, 3=BP1, 2=BP0, 1=WEL, 0=WIP.
+    // Factory defaults on this chip sometimes leave BP3=1, which protects the
+    // entire array. We write QE=1 and clear SRWD + BPx so erase/program work.
     info!("reading status register...");
     let mut status = [0u8; 1];
     unwrap!(q.blocking_custom_instruction(0x05, &[], &mut status));
     info!("status register: 0x{:02x}", status[0]);
 
-    if status[0] & 0x40 == 0 {
-        status[0] |= 0x40;
+    const DESIRED_STATUS: u8 = 0x40; // QE=1, no block protection, no SRWD.
+    if status[0] != DESIRED_STATUS {
+        warn!(
+            "updating status 0x{:02x} -> 0x{:02x} (set QE, clear BPx/SRWD)",
+            status[0], DESIRED_STATUS
+        );
+        unwrap!(q.blocking_custom_instruction(0x01, &[DESIRED_STATUS], &mut []));
 
-        unwrap!(q.blocking_custom_instruction(0x01, &status, &mut []));
-
-        warn!("enabled quad in status");
+        // Verify it stuck.
+        unwrap!(q.blocking_custom_instruction(0x05, &[], &mut status));
+        info!("status after WRSR: 0x{:02x}", status[0]);
+        if status[0] != DESIRED_STATUS {
+            error!("WRSR did not take effect! Got 0x{:02x}", status[0]);
+            panic!();
+        }
     }
 
     let mut buf = AlignedBuf([0u8; PAGE_SIZE]);
@@ -84,15 +95,30 @@ fn main() -> ! {
     let pattern = |a: u32| (a ^ (a >> 8) ^ (a >> 16) ^ (a >> 24)) as u8;
 
     for i in 0..8 {
-        info!("page {:?}: erasing... ", i);
-        unwrap!(q.blocking_erase(i * PAGE_SIZE as u32));
+        let addr = i * PAGE_SIZE as u32;
 
+        info!("page {:?}: erasing...", i);
+        unwrap!(q.blocking_erase(addr));
+
+        info!("verifying erase...");
+        // Fill buf with a non-0xFF sentinel so a silent "read returned nothing"
+        // can't masquerade as a successful erase.
+        buf.0.fill(0xA5);
+        unwrap!(q.blocking_read(addr, &mut buf.0));
+        for (j, &b) in buf.0.iter().enumerate() {
+            if b != 0xFF {
+                error!("erase verify FAILED at page {}, offset {}: got 0x{:02x}", i, j, b);
+                panic!("erase verify failed");
+            }
+        }
+
+        loop {}
         for j in 0..PAGE_SIZE {
-            buf.0[j] = pattern((j as u32 + i * PAGE_SIZE as u32) as u32);
+            buf.0[j] = pattern((j as u32 + addr) as u32);
         }
 
         info!("programming...");
-        unwrap!(q.blocking_write(i * PAGE_SIZE as u32, &buf.0));
+        unwrap!(q.blocking_write(addr, &buf.0));
     }
 
     for i in 0..8 {
@@ -104,9 +130,8 @@ fn main() -> ! {
             assert_eq!(buf.0[j], pattern((j as u32 + i * PAGE_SIZE as u32) as u32));
         }
     }
-
     info!("done!");
-    loop {}*/
+    loop {}
 }
 
 static SQSPI_FW: &[u8] = &[

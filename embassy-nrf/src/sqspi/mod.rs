@@ -163,10 +163,16 @@ pub struct Config {
     pub lines: SpiLines,
     /// Address mode (24-bit or 32-bit).
     pub address_mode: AddressMode,
-    /// Read command opcode (e.g. 0x6B for Quad Output Read).
+    /// Read command opcode (e.g. 0xEB for Quad I/O Read, 0x6B for Quad Output Read).
     pub read_opcode: u8,
-    /// Write/program command opcode (e.g. 0x32 for Quad Page Program).
+    /// Write/program command opcode (e.g. 0x38 for Quad I/O PP, 0x32 for Quad Output PP).
     pub write_opcode: u8,
+    /// Number of dummy/wait cycles after the address phase of a read.
+    ///
+    /// The correct value is opcode- and flash-specific. Common defaults for
+    /// MX25R-class SPI NOR: `0xEB` (Quad I/O Read) → 6, `0x6B` (Quad Output
+    /// Read) → 8, `0x0B` (Fast Read) → 8, `0x03` (Read) → 0.
+    pub read_dummy_cycles: u8,
     /// Flash memory capacity in bytes (for bounds checking). 0 disables bounds checks.
     pub capacity: u32,
     /// Optional RX sample delay in clock cycles.
@@ -175,13 +181,16 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        // Defaults align with the nRF52 QSPI driver: READ4IO (0xEB, 1-4-4,
+        // 6 dummy) + PP4IO (0x38, 1-4-4). Requires the flash's QE bit set.
         Self {
             frequency: Frequency::M8,
             spi_mode: MODE_0,
-            lines: SpiLines::Quad1_1_4,
+            lines: SpiLines::Quad1_4_4,
             address_mode: AddressMode::_24Bit,
-            read_opcode: 0x6B,
-            write_opcode: 0x32,
+            read_opcode: 0xEB,
+            write_opcode: 0x38,
+            read_dummy_cycles: 6,
             capacity: 0,
             sample_delay: None,
         }
@@ -681,6 +690,7 @@ impl<'d> Sqspi<'d> {
         data_ptr: *mut u8,
         data_len: usize,
         dir: TransferDir,
+        lines: SpiLines,
     ) {
         info!(
             "start_transfer: opcode=0x{:02x}, addr=0x{:08x}, addr_bits={}, wait={}, len={}, dir={}",
@@ -711,7 +721,7 @@ impl<'d> Sqspi<'d> {
             Polarity::IdleLow => 0,  // INACTIVEHIGH (=0): idle low
             Polarity::IdleHigh => 1, // INACTIVELOW (=1): idle high
         };
-        let spi_frf: u32 = match self.config.lines {
+        let spi_frf: u32 = match lines {
             SpiLines::Single => 0,
             SpiLines::Dual1_1_2 | SpiLines::Dual1_2_2 => 1,
             SpiLines::Quad1_1_4 | SpiLines::Quad1_4_4 => 2,
@@ -726,7 +736,7 @@ impl<'d> Sqspi<'d> {
         trace!("CTRLR0=0x{:08x}", ctrlr0);
 
         // SPICTRLR0: multi-line mode, address length, 8-bit instruction, dummy cycles.
-        let transtype: u32 = match self.config.lines {
+        let transtype: u32 = match lines {
             SpiLines::Single | SpiLines::Dual1_1_2 | SpiLines::Quad1_1_4 => 0,
             SpiLines::Dual1_2_2 | SpiLines::Quad1_4_4 => 1,
         };
@@ -829,11 +839,67 @@ impl<'d> Sqspi<'d> {
         }
     }
 
-    /// Wait/dummy cycles for read operations based on line mode.
-    fn read_wait_cycles(&self) -> u32 {
-        match self.config.lines {
-            SpiLines::Single => 0,
-            _ => 8,
+    // ========================================================================
+    // Flash-level helpers (WREN / WIP-wait)
+    // ========================================================================
+    //
+    // SPI NOR flashes silently ignore write/erase commands unless WEL is set
+    // by WREN (0x06) first, and stay busy (WIP=1 in RDSR) for milliseconds
+    // afterwards. The nRF52 QSPI peripheral has WREN/WIPWAIT bits in
+    // CINSTRCONF that automate this; on sQSPI we have to do it in software.
+
+    /// Issue Write Enable (0x06).
+    fn write_enable_blocking(&mut self) {
+        self.start_transfer(
+            0x06, 0, 0, 0, ptr::null_mut(), 0,
+            TransferDir::TxOnly, SpiLines::Single,
+        );
+        self.blocking_wait_done();
+    }
+
+    /// Poll RDSR (0x05) until WIP (bit 0) clears.
+    fn wait_wip_blocking(&mut self) {
+        let mut iters: u32 = 0;
+        loop {
+            let mut status = [0u8; 1];
+            self.start_transfer(
+                0x05, 0, 0, 0, status.as_mut_ptr(), 1,
+                TransferDir::RxOnly, SpiLines::Single,
+            );
+            self.blocking_wait_done();
+            if iters == 0 {
+                info!("wait_wip: first status=0x{:02x} (WIP={} WEL={} QE={})",
+                    status[0], status[0] & 1, (status[0] >> 1) & 1, (status[0] >> 6) & 1);
+            }
+            if status[0] & 0x01 == 0 {
+                if iters > 0 {
+                    info!("wait_wip: cleared after {} iters, final=0x{:02x}", iters, status[0]);
+                }
+                break;
+            }
+            iters += 1;
+        }
+    }
+
+    async fn write_enable(&mut self) {
+        self.start_transfer(
+            0x06, 0, 0, 0, ptr::null_mut(), 0,
+            TransferDir::TxOnly, SpiLines::Single,
+        );
+        self.wait_done().await;
+    }
+
+    async fn wait_wip(&mut self) {
+        loop {
+            let mut status = [0u8; 1];
+            self.start_transfer(
+                0x05, 0, 0, 0, status.as_mut_ptr(), 1,
+                TransferDir::RxOnly, SpiLines::Single,
+            );
+            self.wait_done().await;
+            if status[0] & 0x01 == 0 {
+                break;
+            }
         }
     }
 
@@ -844,7 +910,7 @@ impl<'d> Sqspi<'d> {
         }
         self.bounds_check(address, data.len())?;
         let addr_bits = self.addr_len_bits();
-        let wait = self.read_wait_cycles();
+        let wait = self.config.read_dummy_cycles as u32;
         self.start_transfer(
             self.config.read_opcode,
             address,
@@ -853,6 +919,7 @@ impl<'d> Sqspi<'d> {
             data.as_mut_ptr(),
             data.len(),
             TransferDir::RxOnly,
+            self.config.lines,
         );
         self.wait_done().await;
         Ok(())
@@ -865,6 +932,7 @@ impl<'d> Sqspi<'d> {
         }
         self.bounds_check(address, data.len())?;
         let addr_bits = self.addr_len_bits();
+        self.write_enable().await;
         self.start_transfer(
             self.config.write_opcode,
             address,
@@ -873,8 +941,10 @@ impl<'d> Sqspi<'d> {
             data.as_ptr() as *mut u8,
             data.len(),
             TransferDir::TxOnly,
+            self.config.lines,
         );
         self.wait_done().await;
+        self.wait_wip().await;
         Ok(())
     }
 
@@ -884,13 +954,29 @@ impl<'d> Sqspi<'d> {
             return Err(Error::OutOfBounds);
         }
         let addr_bits = self.addr_len_bits();
-        // Sector erase (0x20): no data, no dummy.
-        self.start_transfer(0x20, address, addr_bits, 0, ptr::null_mut(), 0, TransferDir::TxOnly);
+        self.write_enable().await;
+        // Sector erase (0x20): single-line admin command.
+        self.start_transfer(
+            0x20,
+            address,
+            addr_bits,
+            0,
+            ptr::null_mut(),
+            0,
+            TransferDir::TxOnly,
+            SpiLines::Single,
+        );
         self.wait_done().await;
+        self.wait_wip().await;
         Ok(())
     }
 
     /// Execute a custom SPI instruction.
+    ///
+    /// Mirrors nRF52 `CINSTRCONF` behavior: issues WREN (0x06) before the
+    /// opcode and polls WIP (0x05 bit 0) afterwards, so commands that modify
+    /// flash state (WRSR, WRCR, …) work without extra orchestration. Extra
+    /// WREN/WIP cycles on pure-read commands are benign.
     pub async fn custom_instruction(&mut self, opcode: u8, req: &[u8], resp: &mut [u8]) -> Result<(), Error> {
         let dir = if !resp.is_empty() {
             TransferDir::RxOnly
@@ -902,13 +988,17 @@ impl<'d> Sqspi<'d> {
         } else {
             (req.as_ptr() as *mut u8, req.len())
         };
-        // Custom instructions: configured line mode, no address, no dummy.
-        self.start_transfer(opcode, 0, 0, 0, data_ptr, data_len, dir);
+        self.write_enable().await;
+        self.start_transfer(opcode, 0, 0, 0, data_ptr, data_len, dir, SpiLines::Single);
         self.wait_done().await;
+        self.wait_wip().await;
         Ok(())
     }
 
-    /// Execute a custom SPI instruction, blocking version
+    /// Execute a custom SPI instruction, blocking version.
+    ///
+    /// See [`custom_instruction`](Self::custom_instruction) for the WREN /
+    /// WIP-wait semantics.
     pub fn blocking_custom_instruction(&mut self, opcode: u8, req: &[u8], resp: &mut [u8]) -> Result<(), Error> {
         let dir = if !resp.is_empty() {
             TransferDir::RxOnly
@@ -920,9 +1010,10 @@ impl<'d> Sqspi<'d> {
         } else {
             (req.as_ptr() as *mut u8, req.len())
         };
-        // Custom instructions: configured line mode, no address, no dummy.
-        self.start_transfer(opcode, 0, 0, 0, data_ptr, data_len, dir);
+        self.write_enable_blocking();
+        self.start_transfer(opcode, 0, 0, 0, data_ptr, data_len, dir, SpiLines::Single);
         self.blocking_wait_done();
+        self.wait_wip_blocking();
         Ok(())
     }
 
@@ -933,7 +1024,7 @@ impl<'d> Sqspi<'d> {
         }
         self.bounds_check(address, data.len())?;
         let addr_bits = self.addr_len_bits();
-        let wait = self.read_wait_cycles();
+        let wait = self.config.read_dummy_cycles as u32;
         self.start_transfer(
             self.config.read_opcode,
             address,
@@ -942,6 +1033,7 @@ impl<'d> Sqspi<'d> {
             data.as_mut_ptr(),
             data.len(),
             TransferDir::RxOnly,
+            self.config.lines,
         );
         self.blocking_wait_done();
         Ok(())
@@ -954,6 +1046,7 @@ impl<'d> Sqspi<'d> {
         }
         self.bounds_check(address, data.len())?;
         let addr_bits = self.addr_len_bits();
+        self.write_enable_blocking();
         self.start_transfer(
             self.config.write_opcode,
             address,
@@ -962,8 +1055,10 @@ impl<'d> Sqspi<'d> {
             data.as_ptr() as *mut u8,
             data.len(),
             TransferDir::TxOnly,
+            self.config.lines,
         );
         self.blocking_wait_done();
+        self.wait_wip_blocking();
         Ok(())
     }
 
@@ -973,9 +1068,20 @@ impl<'d> Sqspi<'d> {
             return Err(Error::OutOfBounds);
         }
         let addr_bits = self.addr_len_bits();
-        // Sector erase (0x20): no data, no dummy.
-        self.start_transfer(0x20, address, addr_bits, 0, ptr::null_mut(), 0, TransferDir::TxOnly);
+        self.write_enable_blocking();
+        // Sector erase (0x20): single-line admin command.
+        self.start_transfer(
+            0x20,
+            address,
+            addr_bits,
+            0,
+            ptr::null_mut(),
+            0,
+            TransferDir::TxOnly,
+            SpiLines::Single,
+        );
         self.blocking_wait_done();
+        self.wait_wip_blocking();
         Ok(())
     }
 
