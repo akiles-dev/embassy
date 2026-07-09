@@ -1,0 +1,35 @@
+[package]
+edition = "2024"
+name = "embassy-nrf54l15-flpr-sqspi-example"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Clean-room reimplementation of the nRF54L "sQSPI" soft-peripheral firmware
+# that runs on the FLPR RISC-V coprocessor. It is kept in its own crate (rather
+# than as another bin in `nrf54l15-flpr`) because it needs a *different* linker
+# script: 32 bytes at the load base are reserved for the soft-peripheral
+# metadata header, and `_stext` is shifted past it. See `memory.x` and README.
+
+[[bin]]
+name = "sqspi"
+path = "src/main.rs"
+
+[dependencies]
+nrf-pac = { git = "https://github.com/embassy-rs/nrf-pac", rev = "dcbec3723fa14fc81e004ab288c9b2e454dba802", features = ["nrf54l15-flpr"] }
+panic-halt = "1.0"
+
+riscv = { version = "0.16.0", features = ["critical-section-single-hart"] }
+riscv-rt = { version = "0.17.1", features = ["single-hart"] }
+
+[profile.release]
+# Small, deterministic code: the whole image (header + code + data) must fit in
+# the firmware code region declared in the header (0x3740 bytes).
+opt-level = "s"
+lto = true
+debug = 2
+
+[package.metadata.embassy]
+build = [
+    {group = "nightly", target = "riscv32emc-unknown-none-elf", "build-std" = ["core", "compiler_builtins"]}
+]
