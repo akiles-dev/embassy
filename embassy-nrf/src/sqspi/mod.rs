@@ -550,11 +550,16 @@ impl<'d> Sqspi<'d> {
         core.dr(3).write_value(ptr);
         core.dr(4).write_value(len as u32);
 
+        // DIAGNOSTIC: localize where a stuck transfer wedges. Remove after bring-up.
+        info!("sqspi diag: start arming, hb={}", core.dr(29).read());
         self.csb();
+        info!("sqspi diag: csb ok, hb={}", self.regs.core().dr(29).read());
         core.sqspienr().write_value(1);
         self.asb();
+        info!("sqspi diag: asb ok, hb={}", self.regs.core().dr(29).read());
         cortex_m::asm::dmb();
         self.vpr.tasks_trigger(regs::SP_VPR_TASK_DPPI_0_IDX).write_value(1);
+        info!("sqspi diag: kicked");
     }
 
     /// Tear down a finished transfer: clear the event, disable the core, ASB.
@@ -589,7 +594,7 @@ impl<'d> Sqspi<'d> {
     fn blocking_wait_done(&mut self) -> Result<(), Error> {
         // DIAGNOSTIC: bounded spin so a stuck transfer dumps FLPR state instead
         // of hanging forever. Remove once bring-up is done.
-        let mut budget: u32 = 50_000_000;
+        let mut budget: u32 = 4_000_000;
         let res = loop {
             if self.regs.events_dma().aborted().read() != 0 {
                 self.regs.events_dma().aborted().write_value(0);
@@ -603,8 +608,8 @@ impl<'d> Sqspi<'d> {
             budget -= 1;
             if budget == 0 {
                 let core = self.regs.core();
-                warn!(
-                    "sqspi diag: TIMEOUT done={} aborted={} sqspienr={} aux0={} aux1={} phase={} info={}",
+                info!(
+                    "sqspi diag: TIMEOUT done={} aborted={} sqspienr={} aux0={} aux1={} phase={} info={} hb={}",
                     self.regs.events_dma().done().read(),
                     self.regs.events_dma().aborted().read(),
                     core.sqspienr().read(),
@@ -612,6 +617,7 @@ impl<'d> Sqspi<'d> {
                     self.regs.spsync().aux(1).read(),
                     core.dr(30).read(),
                     core.dr(31).read(),
+                    core.dr(29).read(),
                 );
                 break Err(Error::Transfer);
             }

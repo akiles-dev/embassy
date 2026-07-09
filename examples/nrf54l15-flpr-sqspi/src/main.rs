@@ -434,7 +434,13 @@ fn main() -> ! {
     // after the action barrier that follows SQSPIENR=1. No VEVIF/CLIC receive
     // path is needed — the barriers and the "go" condition are all in RAM.
     let mut barriers: u32 = 0;
+    let mut heartbeat: u32 = 0;
     loop {
+        // DIAGNOSTIC heartbeat: proves the poll loop is still spinning even when
+        // no barrier is pending. Host reads dr(29) to confirm liveness.
+        heartbeat = heartbeat.wrapping_add(1);
+        reg_wr(C_DR0 + 29 * 4, heartbeat);
+
         let a0 = reg_rd(AUX0);
         if a0 != reg_rd(AUX1) {
             // A barrier was requested. Acknowledge it (order any prior observed
