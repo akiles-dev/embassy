@@ -81,22 +81,29 @@ async fn main(_spawner: Spawner) {
     ));
     info!("driver ready (firmware booted: ENABLE handshake completed)");
 
+    // NOTE: diagnostic build — this uses the **blocking** API on purpose. The
+    // blocking path spins on the `DONE` flag in shared RAM and never depends on
+    // the VPR00 completion interrupt, so it isolates the bit-bang PHY / transfer
+    // path from the completion-event→IRQ path. If this works end-to-end but the
+    // async version hangs, the bug is only in `trigger_done_event` (the FLPR
+    // must raise EVENTS_TRIGGERED[20] via the VEVIF CSR, not a plain MMIO write).
+
     // 1. JEDEC id (single-line Rx) — the first thing to confirm the bit-bang
     //    PHY clocks and samples correctly.
     let mut id = [0; 3];
-    unwrap!(q.custom_instruction(0x9F, &[], &mut id).await);
+    unwrap!(q.blocking_custom_instruction(0x9F, &[], &mut id));
     info!("JEDEC id: {=[u8]:#04x}", id);
 
     // 2. Status register (single-line Rx).
     let mut status = [0; 1];
-    unwrap!(q.custom_instruction(0x05, &[], &mut status).await);
+    unwrap!(q.blocking_custom_instruction(0x05, &[], &mut status));
     info!("status: {=u8:#04x}", status[0]);
 
     // 3. Quad-enable (status bit 6) so the quad data phases below work, and
     //    clear the block-protection bits.
     info!("enabling quad mode (QE)...");
-    unwrap!(q.custom_instruction(0x01, &[0x40], &mut []).await);
-    unwrap!(q.custom_instruction(0x05, &[], &mut status).await);
+    unwrap!(q.blocking_custom_instruction(0x01, &[0x40], &mut []));
+    unwrap!(q.blocking_custom_instruction(0x05, &[], &mut status));
     info!("status now: {=u8:#04x} (QE={=u8})", status[0], (status[0] >> 6) & 1);
 
     // 4. Erase + program + read-back verify, one page at a time.
@@ -105,18 +112,18 @@ async fn main(_spawner: Spawner) {
 
     for i in 0..8 {
         info!("page {}: erasing...", i);
-        unwrap!(q.erase(i * PAGE_SIZE as u32).await);
+        unwrap!(q.blocking_erase(i * PAGE_SIZE as u32));
 
         for j in 0..PAGE_SIZE {
             buf.0[j] = pattern(j as u32 + i * PAGE_SIZE as u32);
         }
         info!("programming...");
-        unwrap!(q.write(i * PAGE_SIZE as u32, &buf.0).await);
+        unwrap!(q.blocking_write(i * PAGE_SIZE as u32, &buf.0));
     }
 
     for i in 0..8 {
         info!("page {}: reading...", i);
-        unwrap!(q.read(i * PAGE_SIZE as u32, &mut buf.0).await);
+        unwrap!(q.blocking_read(i * PAGE_SIZE as u32, &mut buf.0));
 
         info!("verifying...");
         for j in 0..PAGE_SIZE {
