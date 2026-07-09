@@ -592,36 +592,43 @@ impl<'d> Sqspi<'d> {
 
     /// Spin until transfer completion.
     fn blocking_wait_done(&mut self) -> Result<(), Error> {
-        // DIAGNOSTIC: bounded spin so a stuck transfer dumps FLPR state instead
-        // of hanging forever. Remove once bring-up is done.
-        let mut budget: u32 = 4_000_000;
-        let res = loop {
-            if self.regs.events_dma().aborted().read() != 0 {
-                self.regs.events_dma().aborted().write_value(0);
-                break Err(Error::Transfer);
+        // DIAGNOSTIC: instead of hanging, take up to 8 short polling attempts and
+        // dump the FLPR state after each so we can watch it live. Remove after
+        // bring-up.
+        let mut res = Err(Error::Transfer);
+        'outer: for attempt in 0..8u32 {
+            let mut budget: u32 = 300_000;
+            loop {
+                if self.regs.events_dma().aborted().read() != 0 {
+                    self.regs.events_dma().aborted().write_value(0);
+                    res = Err(Error::Transfer);
+                    break 'outer;
+                }
+                if self.regs.events_dma().done().read() != 0 {
+                    cortex_m::asm::dmb();
+                    self.regs.events_dma().done().write_value(0);
+                    res = Ok(());
+                    break 'outer;
+                }
+                budget -= 1;
+                if budget == 0 {
+                    break;
+                }
             }
-            if self.regs.events_dma().done().read() != 0 {
-                cortex_m::asm::dmb();
-                self.regs.events_dma().done().write_value(0);
-                break Ok(());
-            }
-            budget -= 1;
-            if budget == 0 {
-                let core = self.regs.core();
-                info!(
-                    "sqspi diag: TIMEOUT done={} aborted={} sqspienr={} aux0={} aux1={} phase={} info={} hb={}",
-                    self.regs.events_dma().done().read(),
-                    self.regs.events_dma().aborted().read(),
-                    core.sqspienr().read(),
-                    self.regs.spsync().aux(0).read(),
-                    self.regs.spsync().aux(1).read(),
-                    core.dr(30).read(),
-                    core.dr(31).read(),
-                    core.dr(29).read(),
-                );
-                break Err(Error::Transfer);
-            }
-        };
+            let core = self.regs.core();
+            info!(
+                "sqspi diag: wait[{}] done={} aborted={} sqspienr={} aux0={} aux1={} phase={} info={} hb={}",
+                attempt,
+                self.regs.events_dma().done().read(),
+                self.regs.events_dma().aborted().read(),
+                core.sqspienr().read(),
+                self.regs.spsync().aux(0).read(),
+                self.regs.spsync().aux(1).read(),
+                core.dr(30).read(),
+                core.dr(31).read(),
+                core.dr(29).read(),
+            );
+        }
         self.finish();
         res
     }
