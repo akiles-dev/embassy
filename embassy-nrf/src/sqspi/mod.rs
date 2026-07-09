@@ -447,7 +447,10 @@ impl<'d> Sqspi<'d> {
         sp.events_dma().events_done().job().write_value(0);
 
         T::Interrupt::unpend();
-        unsafe { T::Interrupt::enable() };
+        // DIAGNOSTIC: NVIC enable disabled to test whether the FLPR completion
+        // event storms the VPR00 IRQ. The blocking path polls DONE in RAM and
+        // doesn't need the interrupt. Re-enable once bring-up is done.
+        // unsafe { T::Interrupt::enable() };
 
         Ok(this)
     }
