@@ -104,6 +104,18 @@ const C_DR0: usize = CORE + 0x60; // DR[n] at +0x60 + 4*n
 const C_RXSAMPLEDELAY: usize = CORE + 0xF0;
 const C_SPICTRLR0: usize = CORE + 0xF4;
 
+// DIAGNOSTIC scratch registers: spare DR slots the host never uses. dr(30)/dr(31)
+// live at CORE+0x60+30*4 = +0x180 and +0x184, still inside the CORE block
+// (0x0A8..0x1A8), below SPSYNC. The host reads these back to see how far the
+// firmware got. Remove once bring-up is done.
+const D_PHASE: usize = C_DR0 + 30 * 4; // last milestone reached
+const D_INFO: usize = C_DR0 + 31 * 4; // (barrier_count << 8) | (sqspienr & 0xff)
+
+#[inline(always)]
+fn trace(phase: u32) {
+    reg_wr(D_PHASE, phase);
+}
+
 // SPSYNC handshake words.
 const AUX0: usize = SPSYNC + 0x00;
 const AUX1: usize = SPSYNC + 0x04;
@@ -328,11 +340,13 @@ fn run_transfer() {
     let data_width = width_of(frf);
 
     // --- begin transaction ---
+    trace(0x10); // entered run_transfer
     phy.clock_idle();
     set_level(CSN, false); // assert CS#
 
     // 1. command: 8 bits, always single line.
     phy.write_bits(opcode & 0xFF, 8, 1);
+    trace(0x11); // opcode clocked out
 
     // 2. address (skip if addr_bits == 0).
     if addr_bits > 0 {
@@ -370,12 +384,15 @@ fn run_transfer() {
     set_level(IO3, true);
 
     set_level(CSN, true); // deassert CS#
+    trace(0x12); // data phase complete, CS# released
 
     // --- signal completion ---
     compiler_fence(Ordering::SeqCst);
     fence(Ordering::SeqCst); // order data/RAM writes before the event
     reg_wr(E_DMA_DONE, 1);
+    trace(0x13); // DONE written
     trigger_done_event();
+    trace(0x14); // completion event triggered
 }
 
 /// Raise the transfer-complete event the host's `VPR00` interrupt keys on
@@ -411,10 +428,12 @@ fn boot_init() {
 #[entry]
 fn main() -> ! {
     boot_init();
+    trace(1); // booted, entering poll loop
 
     // Poll loop: service sync barriers (AUX echo) and run an armed transfer
     // after the action barrier that follows SQSPIENR=1. No VEVIF/CLIC receive
     // path is needed — the barriers and the "go" condition are all in RAM.
+    let mut barriers: u32 = 0;
     loop {
         let a0 = reg_rd(AUX0);
         if a0 != reg_rd(AUX1) {
@@ -424,9 +443,15 @@ fn main() -> ! {
             reg_wr(AUX1, a0);
             fence(Ordering::SeqCst);
 
+            // DIAGNOSTIC: record how many barriers we've serviced and the
+            // SQSPIENR value we observe at this one.
+            barriers = barriers.wrapping_add(1);
+            let en = reg_rd(C_SQSPIENR);
+            reg_wr(D_INFO, (barriers << 8) | (en & 0xff));
+
             // If a transfer is armed (SQSPIENR=1), this was the action barrier
             // that precedes the start trigger — run it now.
-            if reg_rd(C_SQSPIENR) & 1 != 0 {
+            if en & 1 != 0 {
                 run_transfer();
             }
         }

@@ -587,6 +587,9 @@ impl<'d> Sqspi<'d> {
 
     /// Spin until transfer completion.
     fn blocking_wait_done(&mut self) -> Result<(), Error> {
+        // DIAGNOSTIC: bounded spin so a stuck transfer dumps FLPR state instead
+        // of hanging forever. Remove once bring-up is done.
+        let mut budget: u32 = 50_000_000;
         let res = loop {
             if self.regs.events_dma().aborted().read() != 0 {
                 self.regs.events_dma().aborted().write_value(0);
@@ -596,6 +599,21 @@ impl<'d> Sqspi<'d> {
                 cortex_m::asm::dmb();
                 self.regs.events_dma().done().write_value(0);
                 break Ok(());
+            }
+            budget -= 1;
+            if budget == 0 {
+                let core = self.regs.core();
+                warn!(
+                    "sqspi diag: TIMEOUT done={} aborted={} sqspienr={} aux0={} aux1={} phase={} info={}",
+                    self.regs.events_dma().done().read(),
+                    self.regs.events_dma().aborted().read(),
+                    core.sqspienr().read(),
+                    self.regs.spsync().aux(0).read(),
+                    self.regs.spsync().aux(1).read(),
+                    core.dr(30).read(),
+                    core.dr(31).read(),
+                );
+                break Err(Error::Transfer);
             }
         };
         self.finish();
