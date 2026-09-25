@@ -8,6 +8,7 @@ mod aes;
 mod chacha;
 mod ct;
 mod ec;
+mod field;
 mod hash;
 mod hkdf;
 
