@@ -306,6 +306,44 @@ pub fn mac<M: Mac>(suite: &Suite<vectors::Mac>) -> Outcome {
 }
 
 // =============================================================================
+// HKDF
+// =============================================================================
+
+/// Run the HKDF-SHA-256 suite, through both `new` and `extract` + `from_prk`.
+pub fn hkdf(suite: &Suite<vectors::Hkdf>) -> Outcome {
+    use embassy_crypto::HkdfSha256;
+
+    run(
+        suite,
+        |_, c| c.tc_id,
+        |case| {
+            let mut buf = [0u8; HkdfSha256::MAX_OUTPUT_SIZE + 1];
+            if case.size > buf.len() {
+                return Ok(Verdict::Skip);
+            }
+            let okm = &mut buf[..case.size];
+
+            let accepted = HkdfSha256::new(case.salt, case.ikm).expand(case.info, okm).is_ok();
+            let check = case.result != Expected::Invalid;
+            if accepted && check && *okm != *case.okm {
+                return Err("wrong output");
+            }
+
+            let (prk, _) = HkdfSha256::extract(case.salt, case.ikm);
+            okm.fill(0);
+            let accepted_prk = HkdfSha256::from_prk(&prk)
+                .map_err(|_| "extracted key rejected")?
+                .expand(case.info, okm)
+                .is_ok();
+            if accepted != accepted_prk || (accepted && check && *okm != *case.okm) {
+                return Err("new and from_prk disagree");
+            }
+            judge(case.result, accepted)
+        },
+    )
+}
+
+// =============================================================================
 // AES
 // =============================================================================
 
@@ -1492,6 +1530,9 @@ named! {
     hmac_sha512_224 => mac::<embassy_crypto::HmacSha512_224>(&HMAC_SHA512_224);
     /// HMAC-SHA-512/256 (Wycheproof `hmac_sha512_256_test`).
     hmac_sha512_256 => mac::<embassy_crypto::HmacSha512_256>(&HMAC_SHA512_256);
+
+    /// HKDF-SHA-256 (Wycheproof `hkdf_sha256_test`).
+    hkdf_sha256 => hkdf(&HKDF_SHA256);
 
     /// AES-128 ECB (generated).
     aes128_ecb => aes_ecb::<embassy_crypto::Aes128>(&AES_ECB_128);
