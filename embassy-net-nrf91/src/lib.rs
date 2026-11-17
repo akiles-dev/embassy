@@ -231,7 +231,7 @@ async fn new_internal<'a>(
 
         tx_seq_no: 0,
         tx_buf_used: [false; TX_BUF_COUNT],
-        ctrl_buf_used: false,
+        ctrl_buf_used: [false; CTRL_BUF_COUNT],
         tx_waker: WakerRegistration::new(),
 
         trace_chans: Vec::new(),
@@ -314,8 +314,10 @@ const TX_BUF_COUNT: usize = 4;
 #[cfg(not(feature = "tx-buf-count-4"))]
 const TX_BUF_COUNT: usize = 8;
 const TX_BUF_SIZE: usize = 1500;
+/// The modem can hold a control buffer after the response, until it gets the next message.
+const CTRL_BUF_COUNT: usize = 2;
 
-/// Control requests use a dedicated buffer, so full IP buffers cannot block them.
+/// Control requests use dedicated buffers, so full IP buffers cannot block them.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 enum TxKind {
@@ -339,7 +341,10 @@ struct PendingRequest {
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-struct NoFreeBufs;
+enum NoFreeBufs {
+    TxBuf,
+    MsgSlot,
+}
 
 struct StateInner {
     init: bool,
@@ -364,7 +369,7 @@ struct StateInner {
 
     tx_seq_no: u16,
     tx_buf_used: [bool; TX_BUF_COUNT],
-    ctrl_buf_used: bool,
+    ctrl_buf_used: [bool; CTRL_BUF_COUNT],
     tx_waker: WakerRegistration,
 
     trace_chans: Vec<TraceChannelInfo, TRACE_CHANNEL_COUNT>,
@@ -556,7 +561,7 @@ impl StateInner {
         return None;
     }
 
-    fn find_handle_control_free(&mut self) -> Option<usize> {
+    fn find_free_tx_buf(&mut self) -> Option<usize> {
         for i in 0..TX_BUF_COUNT {
             if !self.tx_buf_used[i] {
                 trace!("using tx buf idx {}", i);
@@ -569,17 +574,14 @@ impl StateInner {
     fn alloc_tx_buf(&mut self, kind: TxKind) -> Option<*mut u8> {
         match kind {
             TxKind::Ip => {
-                let idx = self.find_handle_control_free()?;
+                let idx = self.find_free_tx_buf()?;
                 self.tx_buf_used[idx] = true;
                 Some(unsafe { addr_of_mut!((*self.cb).tx_bufs[idx]) } as *mut u8)
             }
             TxKind::Control => {
-                if self.ctrl_buf_used {
-                    trace!("control buf in use");
-                    return None;
-                }
-                self.ctrl_buf_used = true;
-                Some(unsafe { addr_of_mut!((*self.cb).ctrl_buf) } as *mut u8)
+                let idx = self.ctrl_buf_used.iter().position(|&u| !u)?;
+                self.ctrl_buf_used[idx] = true;
+                Some(unsafe { addr_of_mut!((*self.cb).ctrl_bufs[idx]) } as *mut u8)
             }
         }
     }
@@ -591,7 +593,7 @@ impl StateInner {
             self.send_message_raw(msg)
         } else {
             assert!(data.len() <= TX_BUF_SIZE);
-            let buf = self.alloc_tx_buf(kind).ok_or(NoFreeBufs)?;
+            let buf = self.alloc_tx_buf(kind).ok_or(NoFreeBufs::TxBuf)?;
             unsafe { copy_nonoverlapping(data.as_ptr(), buf, data.len()) }
             msg.data = buf;
             msg.data_len = data.len();
@@ -616,7 +618,7 @@ impl StateInner {
         };
 
         // allocate a msg.
-        let idx = self.find_free_message(ch).ok_or(NoFreeBufs)?;
+        let idx = self.find_free_message(ch).ok_or(NoFreeBufs::MsgSlot)?;
 
         debug!("tx seq {} msg: {:?}", self.tx_seq_no, msg);
 
@@ -641,18 +643,19 @@ impl StateInner {
     }
 
     fn handle_control_free(&mut self, ptr: *mut u8) {
-        let ctrl = unsafe { addr_of!((*self.cb).ctrl_buf) } as *mut u8;
-        if ptr == ctrl {
-            trace!("control free pointer {:08x} (control buf)", ptr as usize);
-            if !self.ctrl_buf_used {
-                warn!(
-                    "control free pointer {:08x}: control buf was already free??",
-                    ptr as usize
-                );
+        for idx in 0..CTRL_BUF_COUNT {
+            if ptr == unsafe { addr_of!((*self.cb).ctrl_bufs[idx]) } as *mut u8 {
+                trace!("control free pointer {:08x} (control buf {})", ptr as usize, idx);
+                if !self.ctrl_buf_used[idx] {
+                    warn!(
+                        "control free pointer {:08x}: control buf {} was already free??",
+                        ptr as usize, idx
+                    );
+                }
+                self.ctrl_buf_used[idx] = false;
+                self.tx_waker.wake();
+                return;
             }
-            self.ctrl_buf_used = false;
-            self.tx_waker.wake();
-            return;
         }
 
         let base = unsafe { addr_of!((*self.cb).tx_bufs) } as usize;
@@ -891,12 +894,24 @@ impl<'a> Control<'a> {
 
         msg.param[0..4].copy_from_slice(&req_serial.to_le_bytes());
 
+        let mut waiting = false;
         poll_fn(|cx| {
             let mut state = self.state.borrow_mut();
             state.tx_waker.register(cx.waker());
             match state.send_message(msg, req_data, TxKind::Control) {
-                Ok(_) => Poll::Ready(()),
-                Err(NoFreeBufs) => Poll::Pending,
+                Ok(_) => {
+                    if waiting {
+                        warn!("request {:08x}: sent after waiting", msg.id);
+                    }
+                    Poll::Ready(())
+                }
+                Err(e) => {
+                    if !waiting {
+                        warn!("request {:08x}: waiting, no free {:?}", msg.id, e);
+                        waiting = true;
+                    }
+                    Poll::Pending
+                }
             }
         })
         .await;
@@ -1138,7 +1153,7 @@ struct ControlBlock {
     msgs: [[Message; LIST_LEN]; 2],
 
     tx_bufs: [[u8; TX_BUF_SIZE]; TX_BUF_COUNT],
-    ctrl_buf: [u8; TX_BUF_SIZE],
+    ctrl_bufs: [[u8; TX_BUF_SIZE]; CTRL_BUF_COUNT],
 }
 
 #[repr(C)]
@@ -1268,7 +1283,7 @@ mod tests {
             },
             tx_seq_no: 0,
             tx_buf_used: [false; TX_BUF_COUNT],
-            ctrl_buf_used: false,
+            ctrl_buf_used: [false; CTRL_BUF_COUNT],
             tx_waker: WakerRegistration::new(),
             trace_chans: Vec::new(),
             trace_check: PointerChecker {
@@ -1286,15 +1301,31 @@ mod tests {
     fn ip_uses_all_ip_buffers_but_never_the_control_buffer() {
         let mut cb = control_block();
         let mut s = state(&mut *cb);
-        let ctrl = addr_of!(cb.ctrl_buf) as *mut u8;
+        let ctrl0 = addr_of!(cb.ctrl_bufs[0]) as *mut u8;
+        let ctrl1 = addr_of!(cb.ctrl_bufs[1]) as *mut u8;
 
         let bufs: std::vec::Vec<_> = (0..TX_BUF_COUNT).map(|_| s.alloc_tx_buf(TxKind::Ip).unwrap()).collect();
-        assert!(bufs.iter().all(|&b| b != ctrl));
+        assert!(bufs.iter().all(|&b| b != ctrl0 && b != ctrl1));
         assert_eq!(s.alloc_tx_buf(TxKind::Ip), None);
-        assert!(!s.ctrl_buf_used);
+        assert_eq!(s.ctrl_buf_used, [false; CTRL_BUF_COUNT]);
 
-        assert_eq!(s.alloc_tx_buf(TxKind::Control), Some(ctrl));
+        assert_eq!(s.alloc_tx_buf(TxKind::Control), Some(ctrl0));
+        assert_eq!(s.alloc_tx_buf(TxKind::Control), Some(ctrl1));
         assert_eq!(s.alloc_tx_buf(TxKind::Control), None);
+    }
+
+    #[test]
+    fn control_uses_the_second_buffer_when_the_first_is_held() {
+        let mut cb = control_block();
+        let mut s = state(&mut *cb);
+        let first = s.alloc_tx_buf(TxKind::Control).unwrap();
+        let second = s.alloc_tx_buf(TxKind::Control).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(s.tx_buf_used, [false; TX_BUF_COUNT]);
+
+        s.handle_control_free(first);
+        assert_eq!(s.ctrl_buf_used, [false, true]);
+        assert_eq!(s.alloc_tx_buf(TxKind::Control), Some(first));
     }
 
     #[test]
@@ -1306,7 +1337,7 @@ mod tests {
         let ip: std::vec::Vec<_> = (0..TX_BUF_COUNT).map(|_| s.alloc_tx_buf(TxKind::Ip).unwrap()).collect();
 
         s.handle_control_free(ctrl);
-        assert!(!s.ctrl_buf_used);
+        assert_eq!(s.ctrl_buf_used, [false; CTRL_BUF_COUNT]);
         assert!(s.tx_buf_used.iter().all(|&u| u));
 
         s.handle_control_free(ip[2]);
@@ -1324,11 +1355,11 @@ mod tests {
         s.handle_control_free(ip.wrapping_add(1));
         s.handle_control_free(ptr::null_mut());
         assert!(s.tx_buf_used[0]);
-        assert!(s.ctrl_buf_used);
+        assert!(s.ctrl_buf_used[0]);
 
         s.handle_control_free(ip);
         s.handle_control_free(ctrl);
         assert!(!s.tx_buf_used[0]);
-        assert!(!s.ctrl_buf_used);
+        assert!(!s.ctrl_buf_used[0]);
     }
 }
